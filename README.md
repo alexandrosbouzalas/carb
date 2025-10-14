@@ -1,0 +1,1 @@
+carb (Content-Addressable Robust Backup) is a production-grade script with robust parallel ingest, atomic dedupbed blobs, PAR2 creation + verify/repair on recovery, BSD/GNU portability, safe logging, optional MIME capture, excludes, and a self-healing recovery script.
