@@ -1,12 +1,17 @@
 #!/usr/bin/env bash
 #
 # carb — Content-addressable robust backup + per-file ingester with PAR2
-# Usage: ./carb <START_DIR> <REFERENCE_FILE>
 #
-# Scans START_DIR for files strictly newer than REFERENCE_FILE (by mtime),
-# stores bytes in a content-addressed blob store named SIZE_SHA256.data,
-# writes rich per-run metadata, and emits a recovery script that verifies
-# and (if possible) repairs files using PAR2 before restoring.
+# Usage (two modes):
+#   Incremental:  ./carb <START_DIR> <REFERENCE_FILE>
+#   Full backup:  ./carb <START_DIR>            # or: ./carb <START_DIR> --full
+#
+# What it does
+#   - Incremental: backs up files under START_DIR whose mtime is strictly newer than REFERENCE_FILE.
+#   - Full: backs up *all* regular files under START_DIR (no reference file needed).
+#   - Stores bytes in a content-addressed blob store named SIZE_SHA256.data.
+#   - Writes per-run metadata and a recovery script that verifies (and repairs if possible)
+#     using PAR2 before restoring.
 #
 # Environment knobs (sane, robust defaults):
 #   CARB_JOBS             Parallel ingest workers (default: auto-detect cores)
@@ -17,7 +22,11 @@
 #   CARB_PAR2_BLOCKSIZE   PAR2 block size (e.g. 1M); empty = auto
 #   CARB_PAR2_CMD         par2 executable (par2 or par2create; default: par2)
 #   CARB_ENABLE_MIME      1 to detect MIME types via `file` (default: 1)
-#   CARB_EXCLUDE_GLOBS    Comma-separated globs to prune (e.g. "*.tmp,*.swp")
+#   CARB_EXCLUDE_GLOBS    Comma-separated globs to prune (e.g. "*.tmp,*.swp,.DS_Store")
+#
+# Cron setup (interactive after run, if in a TTY):
+#   - Preseed & auto-accept: CARB_CRON_ASK=1 CARB_CRON_YES=1 CARB_CRON_SCHEDULE="@daily" ./carb <...>
+#   - Disable prompt entirely: CARB_CRON_ASK=0
 #
 # Recovery:
 #   export CARB_RECOVER_TO_DIR="/restore/root"
@@ -30,14 +39,17 @@ abort() { echo "ERROR: $*" >&2; exit 1; }
 trap 'abort "line $LINENO exited with status $?"' ERR
 
 # -------------------------------
-# Args & validation
+# Args & mode detection
 # -------------------------------
-if [[ $# -ne 2 ]]; then
-  echo "Usage: $0 <START_DIR> <REFERENCE_FILE>" >&2
+if [[ $# -lt 1 || $# -gt 2 ]]; then
+  echo "Usage:" >&2
+  echo "  Incremental:  $0 <START_DIR> <REFERENCE_FILE>" >&2
+  echo "  Full backup:  $0 <START_DIR>  (or: $0 <START_DIR> --full)" >&2
   exit 64
 fi
+
 START_ARG="$1"
-REF_FILE="$2"
+REF_OR_FLAG="${2-}"
 
 # Normalize START_DIR to absolute (accepts dir or dir/)
 startdir_from_arg() {
@@ -48,9 +60,15 @@ startdir_from_arg() {
   printf '%s\n' "$d"
 }
 CARB_STARTDIR="$(startdir_from_arg "$START_ARG")"
-
 [[ -d "$CARB_STARTDIR" ]] || abort "Start directory does not exist: $CARB_STARTDIR"
-[[ -f "$REF_FILE"       ]] || abort "Reference file does not exist: $REF_FILE"
+
+MODE="incremental"
+if [[ $# -eq 1 || "$REF_OR_FLAG" == "--full" ]]; then
+  MODE="full"
+else
+  REF_FILE="$REF_OR_FLAG"
+  [[ -f "$REF_FILE" ]] || abort "Reference file does not exist: $REF_FILE"
+fi
 
 # -------------------------------
 # Paths & run-scoped variables
@@ -67,7 +85,8 @@ p=sys.argv[1]
 print(os.path.abspath(os.path.realpath(p)))
 PY
 }
-SCRIPT_BASE="$(dirname "$(_resolve "${BASH_SOURCE[0]}")")"
+SCRIPT_PATH="$(_resolve "${BASH_SOURCE[0]}")"
+SCRIPT_BASE="$(dirname "$SCRIPT_PATH")"
 
 DIR_BLOBS="${SCRIPT_BASE}/blobs_sha256"
 DIR_TMP="${CARB_TMPDIR:-${SCRIPT_BASE}/blobs_tmp}"
@@ -83,26 +102,29 @@ detect_cpus() {
   elif [[ "$(uname -s)" == "Darwin" ]]; then sysctl -n hw.ncpu
   else echo 1
   fi
-}
+} 
 CARB_JOBS="${CARB_JOBS:-$(detect_cpus)}"
 [[ "$CARB_JOBS" =~ ^[1-9][0-9]*$ ]] || CARB_JOBS=1
 
-# PAR2 config
+# PAR2 / misc config
 CARB_PAR2="${CARB_PAR2:-1}"
 CARB_PAR2_REDUNDANCY="${CARB_PAR2_REDUNDANCY:-10}"
 CARB_PAR2_BLOCKSIZE="${CARB_PAR2_BLOCKSIZE:-}"
 CARB_PAR2_CMD="${CARB_PAR2_CMD:-par2}"
 CARB_ENABLE_MIME="${CARB_ENABLE_MIME:-1}"
 CARB_EXCLUDE_GLOBS="${CARB_EXCLUDE_GLOBS:-}"
+CARB_CRON_ASK="${CARB_CRON_ASK:-1}"
+CARB_CRON_YES="${CARB_CRON_YES:-}"
+CARB_CRON_SCHEDULE="${CARB_CRON_SCHEDULE:-}"
 
 # Create dirs
 mkdir -p -- "$DIR_BLOBS" "$DIR_TMP" "$DIR_META_ROOT" "$DIR_META_RUN" "$DIR_PAR2" "$DIR_META_RUN/logs"
 
 # Initialize run meta
-: > "${DIR_META_RUN}/file_processed.txt"   # merged later
+: > "${DIR_META_RUN}/file_processed.txt"
 : > "${DIR_META_RUN}/file_skipped.txt"
 : > "${DIR_META_RUN}/file_ingested.txt"
-: > "${DIR_BLOBS}/INDEX.txt"               # merged later (we append per-run at end)
+: > "${DIR_BLOBS}/INDEX.txt"               # ensure exists
 
 RECOVER_SH="${DIR_META_RUN}/ez_recover_from_here.sh"
 printf '#!/usr/bin/env bash\nset -Eeuo pipefail\n: "${CARB_RECOVER_TO_DIR:?set CARB_RECOVER_TO_DIR to a target directory}"\n' > "$RECOVER_SH"
@@ -110,10 +132,10 @@ chmod +x "$RECOVER_SH"
 
 printf '%s\n' "$STARTTIME"                          >> "${DIR_META_RUN}/carb_starttime"
 printf 'pwd=%s CARB_STARTDIR=%s\n' "$PWD_AT_START" "$CARB_STARTDIR" > "${DIR_META_RUN}/carb_startfolder"
-printf 'par2=%s r=%s s=%s cmd=%s jobs=%s\n' \
-  "$CARB_PAR2" "$CARB_PAR2_REDUNDANCY" "${CARB_PAR2_BLOCKSIZE:-auto}" "$CARB_PAR2_CMD" "$CARB_JOBS" \
-  > "${DIR_META_RUN}/carb_par2_settings"
-printf '%s :%s:%s: %s : mnewer ' "$STARTTIME" "$PWD_AT_START" "$CARB_STARTDIR" "$CARB_COMMENT" >> "${DIR_META_ROOT}/ingestedFolders.txt"
+printf 'mode=%s par2=%s r=%s s=%s cmd=%s jobs=%s\n' \
+  "$MODE" "$CARB_PAR2" "$CARB_PAR2_REDUNDANCY" "${CARB_PAR2_BLOCKSIZE:-auto}" "$CARB_PAR2_CMD" "$CARB_JOBS" \
+  > "${DIR_META_RUN}/carb_settings"
+printf '%s :%s:%s: %s : %s ' "$STARTTIME" "$PWD_AT_START" "$CARB_STARTDIR" "$CARB_COMMENT" "$MODE" >> "${DIR_META_ROOT}/ingestedFolders.txt"
 
 # -------------------------------
 # Portable helpers (BSD/GNU)
@@ -142,16 +164,19 @@ hash_stream_sha256() {
   fi
 }
 
-# Cutoff / reference time (strictly newer)
-REF_EPOCH="$(stat_epoch_mtime "$REF_FILE")"
-REF_STR="$(date_from_epoch "$REF_EPOCH")"
-echo "NEWER $REF_EPOCH $REF_STR"
-# append formatted date to ingestedFolders line
-sed -i.bak "s/mnewer.*/mnewer ${REF_STR}/" "${DIR_META_ROOT}/ingestedFolders.txt" 2>/dev/null || true
-
-# Create a temp ref file with the same mtime, for portable find -newer
-TMP_REF="$(mktemp "${DIR_TMP}/ref_${STARTTIME}.XXXX")"
-touch -r "$REF_FILE" "$TMP_REF"
+# Cutoff (only for incremental)
+TMP_REF=""
+if [[ "$MODE" == "incremental" ]]; then
+  REF_EPOCH="$(stat_epoch_mtime "$REF_FILE")"
+  REF_STR="$(date_from_epoch "$REF_EPOCH")"
+  echo "NEWER $REF_EPOCH $REF_STR"
+  sed -i.bak "s/ $MODE .*/ $MODE ref=${REF_STR}/" "${DIR_META_ROOT}/ingestedFolders.txt" 2>/dev/null || true
+  TMP_REF="$(mktemp "${DIR_TMP}/ref_${STARTTIME}.XXXX")"
+  touch -r "$REF_FILE" "$TMP_REF"
+else
+  echo "FULL backup mode (no reference cutoff)"
+  sed -i.bak "s/ $MODE .*/ $MODE full/" "${DIR_META_ROOT}/ingestedFolders.txt" 2>/dev/null || true
+fi
 
 # -------------------------------
 # Recovery helpers (PAR2-aware)
@@ -204,10 +229,10 @@ par2_create_for_blob() {
   local blobpath="$1" blobname="$2" base="${DIR_PAR2}/${blobname}"
   local cmd="$CARB_PAR2_CMD"
 
-  # Find a working command name
+  # Find a working command
   if ! command -v "$cmd" >/dev/null 2>&1; then
     if command -v par2create >/dev/null 2>&1; then cmd=par2create
-    elif command -v par2 >/devnull 2>&1; then cmd=par2
+    elif command -v par2 >/dev/null 2>&1; then cmd=par2
     else
       echo "WARN: PAR2 requested but no par2/par2create found" >&2
       return 0
@@ -221,20 +246,15 @@ par2_create_for_blob() {
 
   # Simple lock dir to avoid duplicate work across workers
   local lock="${DIR_PAR2}/.lock_${blobname}"
-  if mkdir "$lock" 2>/dev/null; then
-    :
-  else
-    # another worker is doing it; wait a bit for completion
+  if ! mkdir "$lock" 2>/dev/null; then
     local tries=50
     while (( tries-- > 0 )) && [[ ! -e "${base}.par2" ]]; do sleep 0.1; done
     return 0
   fi
 
-  # Build args: -r <percent> [-s <blocksize>] -q
   local args=(-q -r "$CARB_PAR2_REDUNDANCY")
   [[ -n "$CARB_PAR2_BLOCKSIZE" ]] && args+=(-s "$CARB_PAR2_BLOCKSIZE")
 
-  # Create parity set (header + volumes) with stable base name
   if "$cmd" create "${args[@]}" "${base}.par2" "$blobpath"; then
     printf '%s\n' "${blobname}" >> "${DIR_META_RUN}/par2_created.txt"
   else
@@ -242,7 +262,6 @@ par2_create_for_blob() {
   fi
   rmdir "$lock" 2>/dev/null || true
 }
-
 export -f par2_create_for_blob
 
 # -------------------------------
@@ -310,7 +329,6 @@ ingest_one() {
 
   # Install blob atomically with dedup (ln as test-and-set)
   if ln "$tmpcopy" "$blobpath" 2>/dev/null; then
-    # ln succeeded: new content (tmpcopy now shares inode with blobpath)
     printf '%s:%s:%s:%s\n' "$blobname" "$PWD_AT_START" "$CARB_STARTDIR" "$abs" >> "$LOG_INGE"
     rm -f -- "$tmpcopy"
 
@@ -324,7 +342,7 @@ ingest_one() {
     # Create parity (best-effort)
     par2_create_for_blob "$blobpath" "$blobname"
   else
-    # blob already exists, discard temp
+    # blob already exists
     printf '%s:%s:%s:%s\n' "$blobname" "$PWD_AT_START" "$CARB_STARTDIR" "$abs" >> "$LOG_SKIP"
     rm -f -- "$tmpcopy"
   fi
@@ -340,14 +358,13 @@ export -f ingest_one abort stat_filesize hash_stream_sha256
 export TODAY DIR_TMP DIR_BLOBS DIR_META_RUN DIR_PAR2 PWD_AT_START CARB_STARTDIR CARB_PAR2_CMD
 
 # -------------------------------
-# Build find command (excludes)
+# Build find command (excludes + mode)
 # -------------------------------
 build_find_cmd() {
   local root="$1"
-  shift || true
   local -a cmd=(find "$root")
 
-  # prune our own internal dirs if they sit under STARTDIR
+  # prune our internal dirs if under STARTDIR
   local -a prune_paths=()
   [[ "$DIR_BLOBS"     == "$CARB_STARTDIR"* ]] && prune_paths+=("$DIR_BLOBS")
   [[ "$DIR_META_ROOT" == "$CARB_STARTDIR"* ]] && prune_paths+=("$DIR_META_ROOT")
@@ -378,39 +395,39 @@ build_find_cmd() {
     cmd+=(")" -prune -o)
   fi
 
-  # main predicate: files newer than TMP_REF
-  cmd+=(-type f -newer "$TMP_REF" -print0)
+  # main predicate depends on mode
+  if [[ "$MODE" == "incremental" ]]; then
+    cmd+=(-type f -newer "$TMP_REF" -print0)
+  else
+    cmd+=(-type f -print0)
+  fi
+
   printf '%s\0' "${cmd[@]}"
 }
 
 # -------------------------------
-# Walk newer files and ingest (parallel)
+# Walk files and ingest (parallel)
 # -------------------------------
 # shellcheck disable=SC2046
 eval "set -- $(build_find_cmd "$CARB_STARTDIR" | tr '\0' ' ')"
-# run the constructed find command, pipe to xargs parallel workers
 "${@}" \
 | xargs -0 -I{} -n1 -P "${CARB_JOBS}" bash -c 'ingest_one "$@"' _ {}
 
 # -------------------------------
-# Merge per-worker logs atomically
+# Merge per-worker logs (FIXED GLOBS)
 # -------------------------------
 LOGDIR="${DIR_META_RUN}/logs"
-# Merge with simple concatenation (no ordering requirement)
 for f in processed skipped ingested; do
-  cat "${LOGDIR}"/_*"${f}".txt 2>/dev/null >> "${DIR_META_RUN}/file_${f}.txt" || true
+  cat "${LOGDIR}"/*_"${f}".txt 2>/dev/null >> "${DIR_META_RUN}/file_${f}.txt" || true
 done
-cat "${LOGDIR}"/_*stat1.txt 2>/dev/null >> "${DIR_META_RUN}/file_stat1.txt" || true
-cat "${LOGDIR}"/_*stat2.txt 2>/dev/null >> "${DIR_META_RUN}/file_stat2.txt" || true
-cat "${LOGDIR}"/_*types.csv 2>/dev/null >> "${DIR_META_RUN}/file_types2.csv" || true
-# Append recovery lines
-cat "${LOGDIR}"/_*recover.sh 2>/dev/null >> "$RECOVER_SH" || true
+cat "${LOGDIR}"/*_stat1.txt  2>/dev/null >> "${DIR_META_RUN}/file_stat1.txt"  || true
+cat "${LOGDIR}"/*_stat2.txt  2>/dev/null >> "${DIR_META_RUN}/file_stat2.txt"  || true
+cat "${LOGDIR}"/*_types.csv  2>/dev/null >> "${DIR_META_RUN}/file_types2.csv" || true
+cat "${LOGDIR}"/*_recover.sh 2>/dev/null >> "$RECOVER_SH"                     || true
 
-# Build a per-run index of NEW blobs only (from ingested)
-# and append unique blobnames to global INDEX.txt (de-dup within this run)
+# Build a per-run index of NEW blobs only and append to global INDEX.txt
 awk -F: '{print $1}' "${DIR_META_RUN}/file_ingested.txt" \
   | sort -u >> "${DIR_META_RUN}/INDEX_NEW.txt" || true
-# Append to global index (no need for sort; duplicates harmless, but keep tidy)
 cat "${DIR_META_RUN}/INDEX_NEW.txt" >> "${DIR_BLOBS}/INDEX.txt" 2>/dev/null || true
 
 # -------------------------------
@@ -425,10 +442,71 @@ echo "$(count_file_lines "${DIR_META_RUN}/file_skipped.txt")   files in file_ski
 echo "$(count_file_lines "${DIR_META_RUN}/file_ingested.txt")  files in file_ingested.txt"
 
 # Cleanup
-rm -f -- "$TMP_REF" 2>/dev/null || true
+[[ -n "$TMP_REF" ]] && rm -f -- "$TMP_REF" 2>/dev/null || true
 
 echo "Done. Meta: ${DIR_META_RUN}"
 echo "Recovery script: ${RECOVER_SH}"
-
-# Append a final newline to recovery for niceness
 echo "" >> "$RECOVER_SH"
+
+# -------------------------------
+# Optional: offer to set up a cron job (TTY only)
+# -------------------------------
+is_tty() { [[ -t 0 && -t 1 ]]; }
+setup_cron_interactive() {
+  command -v crontab >/dev/null 2>&1 || { echo "crontab not available; skipping cron setup." >&2; return 0; }
+
+  local ask="${CARB_CRON_ASK}"
+  if ! is_tty && [[ -z "${CARB_CRON_YES}" ]]; then
+    return 0
+  fi
+  if [[ "$ask" != "0" ]]; then
+    local yn="${CARB_CRON_YES:-}"
+    if [[ -z "$yn" && -t 0 ]]; then
+      read -r -p "Set up a cron job to run this command periodically? [y/N] " yn || true
+    fi
+    if [[ "$yn" != "y" && "$yn" != "Y" && "$yn" != "1" ]]; then
+      echo "Skipping cron setup."
+      return 0
+    fi
+
+    local sched="${CARB_CRON_SCHEDULE:-}"
+    if [[ -z "$sched" && -t 0 ]]; then
+      echo "Enter a cron schedule (examples: '@daily', '@weekly', '0 2 * * *')."
+      read -r -p "Cron schedule [default: @daily]: " sched || true
+    fi
+    sched="${sched:-@daily}"
+
+    # Basic validation: @keyword or 5 fields
+    if [[ ! "$sched" =~ ^@(reboot|yearly|annually|monthly|weekly|daily|hourly)$ && ! "$sched" =~ ^([0-9*/,-]+\ +){4}[0-9*/,-]+$ ]]; then
+      echo "Invalid cron schedule format. Example: '0 2 * * *' or '@daily'." >&2
+      return 1
+    fi
+
+    # Reconstruct invocation exactly like this run
+    local quoted_start
+    printf -v quoted_start "%q" "$START_ARG"
+    local mode_arg=""
+    if [[ "$MODE" == "incremental" ]]; then
+      local quoted_ref; printf -v quoted_ref "%q" "$REF_FILE"
+      mode_arg=" $quoted_ref"
+    else
+      mode_arg=" --full"
+    fi
+    local cmd="cd $(printf %q "$SCRIPT_BASE") && $(printf %q "$SCRIPT_PATH") $quoted_start$mode_arg >> $(printf %q "$SCRIPT_BASE")/carb_cron.log 2>&1"
+
+    # Mark line to identify/replace later
+    local marker="# carb:${SCRIPT_PATH}|${CARB_STARTDIR}|${MODE}"
+    local tmpfile
+    tmpfile="$(mktemp "${DIR_TMP}/crontab.XXXX")"
+    crontab -l 2>/dev/null | grep -vF "$marker" > "$tmpfile" || true
+    {
+      echo "$marker"
+      echo "$sched $cmd"
+    } >> "$tmpfile"
+    crontab "$tmpfile" && echo "Cron installed: $sched  (log: ${SCRIPT_BASE}/carb_cron.log)"
+    rm -f -- "$tmpfile" 2>/dev/null || true
+  fi
+}
+
+setup_cron_interactive || echo "Cron setup skipped or failed."
+echo ""
