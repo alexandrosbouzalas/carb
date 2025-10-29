@@ -59,3 +59,5 @@ To clone:
 git clone https://github.com/alexandrosbouzalas/carb.git
 cd carb
 chmod +x carb.sh
+./install.sh
+```

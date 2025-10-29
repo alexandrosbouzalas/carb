@@ -85,6 +85,38 @@
 #   • The script prunes its own output directories when scanning inside START_DIR.
 #------------------------------------------------------------------------------
 
+if [[ "${1-}" == "--help" ]]; then
+  cat <<'EOF'
+carb — Content-addressable robust backup and per-file ingester with PAR2
+
+Usage:
+  carb <START_DIR> [REFERENCE_FILE | --full]
+
+Modes:
+  Incremental  : backup only files newer than REFERENCE_FILE
+  Full backup  : backup all files under START_DIR
+
+Environment variables:
+  CARB_PAR2=0|1             Enable/disable PAR2 creation (default 1)
+  CARB_JOBS=<n>             Number of parallel workers (default: CPU cores)
+  CARB_EXCLUDE_GLOBS=<g>    Comma-separated exclusion globs
+  CARB_ENABLE_MIME=0|1      MIME detection using 'file' (default 1)
+  CARB_COMMENT=<text>       Optional run comment
+
+Examples:
+  carb /data
+  carb /data /var/backups/last.marker
+  CARB_EXCLUDE_GLOBS=".git,node_modules" carb ~/projects --full
+
+EOF
+  exit 0
+fi
+
+if [[ "${1-}" == "--version" ]]; then
+  echo "carb 1.0 (2025-10-29)"
+  exit 0
+fi
+
 set -Eeuo pipefail
 IFS=$'\n\t'
 
