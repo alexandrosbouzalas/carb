@@ -61,3 +61,9 @@ cd carb
 chmod +x carb.sh
 ./install.sh
 ```
+
+To verify functionality:
+```bash
+chmod +x demo.sh
+./demo.sh
+```

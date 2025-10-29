@@ -5,20 +5,13 @@ set -Eeuo pipefail
 WORKDIR="$(mktemp -d)"; cd "$WORKDIR"
 echo "Demo workspace: $WORKDIR"
 
-# Locate carb script
-CARB_SRC="${CARB_SRC:-}"
-if [[ -z "${CARB_SRC}" ]]; then
-  if [[ -r /opt/carb/carb.sh ]]; then
-    CARB_SRC=/opt/carb/carb.sh
-  elif [[ -r ./carb.sh ]]; then
-    CARB_SRC=./carb.sh
-  else
-    echo "ERROR: Could not find carb.sh. Set \$CARB_SRC or install at /opt/carb/carb.sh (or put carb.sh next to this demo)." >&2
-    exit 1
-  fi
+# Locate global carb and stage a local copy so outputs are self-contained
+CARB_BIN="$(command -v carb || true)"
+if [[ -z "$CARB_BIN" ]]; then
+  echo "ERROR: 'carb' not found in PATH. Install it first, then re-run this demo." >&2
+  exit 1
 fi
-
-cp "$CARB_SRC" ./carb.sh
+cp "$CARB_BIN" ./carb.sh
 chmod +x ./carb.sh
 
 # PAR2 availability (informational)
