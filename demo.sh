@@ -8,18 +8,18 @@ echo "Demo workspace: $WORKDIR"
 # Locate carb script
 CARB_SRC="${CARB_SRC:-}"
 if [[ -z "${CARB_SRC}" ]]; then
-  if [[ -r /opt/carb/carb.bash ]]; then
-    CARB_SRC=/opt/carb/carb.bash
-  elif [[ -r ./carb.bash ]]; then
-    CARB_SRC=./carb.bash
+  if [[ -r /opt/carb/carb.sh ]]; then
+    CARB_SRC=/opt/carb/carb.sh
+  elif [[ -r ./carb.sh ]]; then
+    CARB_SRC=./carb.sh
   else
-    echo "ERROR: Could not find carb.bash. Set \$CARB_SRC or install at /opt/carb/carb.bash (or put carb.bash next to this demo)." >&2
+    echo "ERROR: Could not find carb.sh. Set \$CARB_SRC or install at /opt/carb/carb.sh (or put carb.sh next to this demo)." >&2
     exit 1
   fi
 fi
 
-cp "$CARB_SRC" ./carb.bash
-chmod +x ./carb.bash
+cp "$CARB_SRC" ./carb.sh
+chmod +x ./carb.sh
 
 # PAR2 availability (informational)
 PAR2_BIN="$(command -v par2 || true)"
@@ -39,7 +39,7 @@ echo "ignore me" > data/tmp/scratch.swp
 CARB_EXCLUDE_GLOBS="*.swp,.DS_Store" \
 CARB_COMMENT="initial demo run" \
 CARB_PAR2=1 \
-./carb.bash data --full 2> full_run.stderr || true
+./carb.sh data --full 2> full_run.stderr || true
 
 # Basic artifacts
 echo "== blobs:"; ls -1 blobs_sha256 | head || true
@@ -76,7 +76,7 @@ if touch -d "yesterday" data/media/pic.bin 2>/dev/null; then :; else touch -A -0
 REF_FILE="$RUN_META/carb_starttime"
 
 # --- 4) INCREMENTAL run (capture stderr) -------------------------------------
-CARB_PAR2=1 ./carb.bash data "$REF_FILE" 2> incr_run.stderr || true
+CARB_PAR2=1 ./carb.sh data "$REF_FILE" 2> incr_run.stderr || true
 
 RUN_META2="$(ls -1d blobs_meta/v05_* 2>/dev/null | tail -n1 || true)"
 if [[ -z "${RUN_META2}" ]]; then
@@ -110,7 +110,7 @@ VICTIM_BLOB="${VICTIM_LINE%%:*}"
 # Ensure parity exists for the victim blob; incremental run should have backfilled if missing.
 if ! compgen -G "blobs_par2/${VICTIM_BLOB}.par2" >/dev/null; then
   echo "WARN: Parity for readme.txt blob not found; re-running once to backfill..." >&2
-  CARB_PAR2=1 ./carb.bash data --full >/dev/null 2>&1 || true
+  CARB_PAR2=1 ./carb.sh data --full >/dev/null 2>&1 || true
 fi
 
 echo "Corrupting blobs_sha256/$VICTIM_BLOB (flip 1 byte @ offset 64)"

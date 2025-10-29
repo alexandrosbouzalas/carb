@@ -1,6 +1,90 @@
 #!/usr/bin/env bash
-#
+#------------------------------------------------------------------------------
 # carb — Content-addressable robust backup + per-file ingester with PAR2
+#
+# OVERVIEW
+#   Scans a start directory, ingests every regular file, and stores its bytes
+#   once under a content-addressable blob name "<padded_size>_<sha256>.data".
+#   Subsequent duplicates hardlink to the same blob. A per-run metadata folder
+#   records provenance, stats, MIME types (optional), and generates a recovery
+#   script that can verify/repair bytes with PAR2 and restore original paths.
+#
+#   Modes:
+#     • Full         — ingest all files found under START_DIR
+#     • Incremental  — ingest only files newer than a reference file’s mtime
+#
+# USAGE
+#     Incremental:  carb <START_DIR> <REFERENCE_FILE>
+#     Full backup:  carb <START_DIR>
+#                   carb <START_DIR> --full
+#
+# OUTPUT LAYOUT (relative to this script’s directory)
+#     blobs_sha256/                 # content-addressed data blobs
+#       INDEX.txt                   # appended list of blob names seen across runs
+#     blobs_par2/                   # .par2 and .vol*.par2 parity sets per blob
+#     blobs_tmp/                    # temporary workspace
+#     blobs_meta/
+#       v05_<YYYY-MM-DD_HH_MM_SS>/  # per-run metadata + logs
+#         file_processed.txt        # blobname:cwd:startdir:absolute_path (all seen)
+#         file_skipped.txt          # lines for files deduped by existing blob
+#         file_ingested.txt         # lines for files that produced/linked blob
+#         file_stat1.txt            # portable stat summary (key=value-ish)
+#         file_stat2.txt            # human stat summary (platform-native)
+#         file_types2.csv           # "blobname","mime-type" (if enabled)
+#         par2_created.txt          # blobnames for which PAR2 was emitted
+#         recover.sh                # self-contained recovery helper
+#         carb_starttime            # run timestamp
+#         carb_startfolder          # original PWD and normalized start dir
+#         carb_settings             # run settings (mode, par2 params, jobs)
+#     blobs_meta/ingestedFolders.txt # append-only log of ingested roots
+#
+# DEPENDENCIES
+#   Required:  find, xargs, awk, sed, tee, mktemp, ln, cp, stat, date,
+#              openssl (or shasum)
+#   Optional:  file (for MIME detection)
+#   If PAR2 on: par2cmdline (par2create/par2)
+#
+# AUTO-INSTALL (best-effort; can be disabled)
+#   Attempts to install missing tools via detected package manager (apt, dnf,
+#   yum, pacman, zypper, apk, brew, port) if allowed by the flags below.
+#
+# ENVIRONMENT
+#   CARB_JOBS               # worker parallelism (default: CPU cores)
+#   CARB_PAR2=0|1           # enable parity creation (default: 1)
+#   CARB_PAR2_REDUNDANCY    # % parity if fixed; else adaptive (default: 10)
+#   CARB_PAR2_BLOCKSIZE     # bytes or "auto"/"" for adaptive (default: auto)
+#   CARB_PAR2_CMD           # par2 binary name (default: par2)
+#   CARB_ENABLE_MIME=0|1    # detect MIME using 'file' (default: 1)
+#   CARB_EXCLUDE_GLOBS      # comma-separated globs to prune during find
+#   CARB_TMPDIR             # override tmp directory path
+#   CARB_AUTOINSTALL_ASK    # 1 to prompt (default), 0 to skip prompting
+#   CARB_AUTOINSTALL_YES    # non-empty or "y" to auto-yes install
+#   CARB_PKG_MANAGER        # force a package manager selection
+#   CARB_COMMENT            # freeform note stored with run metadata
+#
+# RECOVERY
+#   Per-run recover.sh requires: CARB_RECOVER_TO_DIR=<destination>
+#   It will verify/repair bytes with PAR2 if available and recreate the original
+#   directory layout under CARB_RECOVER_TO_DIR.
+#
+# EXIT CODES
+#   0   success
+#   64  usage error
+#   69  missing required tools after attempted install
+#   other nonzero codes may come from underlying commands; trapped to show line
+#
+# EXAMPLES
+#   Full:        CARB_COMMENT="NAS mirror" ./carb /data
+#   Incremental: ./carb /data /var/backups/last-full.marker
+#   Exclude:     CARB_EXCLUDE_GLOBS="*.tmp,.git,node_modules" ./carb ~/projects --full
+#
+# NOTES
+#   • Content identity is (size, sha256) to avoid accidental hash collisions on
+#     truncated pipes; size is left-padded to 18 digits in blob names.
+#   • PAR2 block size and parity % are adaptive unless explicitly set.
+#   • The script prunes its own output directories when scanning inside START_DIR.
+#------------------------------------------------------------------------------
+
 set -Eeuo pipefail
 IFS=$'\n\t'
 
@@ -10,9 +94,6 @@ trap 'abort "line $LINENO exited with status $?"' ERR
 have() { command -v "$1" >/dev/null 2>&1; }
 is_tty() { [[ -t 0 && -t 1 ]]; }
 
-# -------------------------------
-# Args & mode detection
-# -------------------------------
 if [[ $# -lt 1 || $# -gt 2 ]]; then
   echo "Usage:" >&2
   echo "  Incremental:  $0 <START_DIR> <REFERENCE_FILE>" >&2
@@ -41,9 +122,6 @@ else
   [[ -f "$REF_FILE" ]] || abort "Reference file does not exist: $REF_FILE"
 fi
 
-# -------------------------------
-# Paths & run-scoped variables
-# -------------------------------
 TODAY=$(date "+%Y-%m-%d") || true
 STARTTIME=$(date "+%Y-%m-%d_%H_%M_%S") || true
 CARB_COMMENT="${CARB_COMMENT:-}"
@@ -76,7 +154,7 @@ CARB_JOBS="${CARB_JOBS:-$(detect_cpus)}"
 
 CARB_PAR2="${CARB_PAR2:-1}"
 CARB_PAR2_REDUNDANCY="${CARB_PAR2_REDUNDANCY:-10}"
-CARB_PAR2_BLOCKSIZE="${CARB_PAR2_BLOCKSIZE:-}"   # "" or "auto" => adaptive
+CARB_PAR2_BLOCKSIZE="${CARB_PAR2_BLOCKSIZE:-}"
 CARB_PAR2_CMD="${CARB_PAR2_CMD:-par2}"
 CARB_ENABLE_MIME="${CARB_ENABLE_MIME:-1}"
 CARB_EXCLUDE_GLOBS="${CARB_EXCLUDE_GLOBS:-}"
@@ -84,9 +162,6 @@ CARB_AUTOINSTALL_ASK="${CARB_AUTOINSTALL_ASK:-1}"
 CARB_AUTOINSTALL_YES="${CARB_AUTOINSTALL_YES:-}"
 CARB_PKG_MANAGER="${CARB_PKG_MANAGER:-}"
 
-# -------------------------------
-# Dependency check
-# -------------------------------
 dep_check_and_maybe_install() {
   local -a missing_req=()
   local -a missing_opt=()
@@ -102,6 +177,7 @@ dep_check_and_maybe_install() {
   echo "==> Pre-flight dependency check" >&2
   (( ${#missing_req[@]} )) && { echo "Missing REQUIRED tools:" >&2; printf '  - %s\n' "${missing_req[@]}" >&2; }
   (( ${#missing_opt[@]} )) && { echo "Missing OPTIONAL tools:" >&2; printf '  - %s\n' "${missing_opt[@]}" >&2; }
+
   local mgr="${CARB_PKG_MANAGER}"
   if [[ -z "$mgr" ]]; then
     if have apt-get; then mgr="apt"
@@ -115,15 +191,27 @@ dep_check_and_maybe_install() {
     else mgr=""
     fi
   fi
+
   local -a install_pkgs=()
   if ! have openssl && ! have shasum; then case "$mgr" in apt|dnf|yum|zypper|apk|pacman|brew|port) install_pkgs+=("openssl");; esac; fi
   if [[ "$CARB_ENABLE_MIME" == "1" ]] && ! have file; then case "$mgr" in apt|dnf|yum|zypper|apk|pacman|port) install_pkgs+=("file");; brew) install_pkgs+=("file-formula");; esac; fi
   if [[ "$CARB_PAR2" == "1" ]] && ! have "$CARB_PAR2_CMD" && ! have par2create && ! have par2; then case "$mgr" in apt|zypper|apk|brew|port) install_pkgs+=("par2");; dnf|yum|pacman) install_pkgs+=("par2cmdline");; esac; fi
+
   if (( ${#install_pkgs[@]} )); then
-    local do_install=""; if [[ "${CARB_AUTOINSTALL_ASK}" == "0" ]]; then do_install="no"; else do_install="${CARB_AUTOINSTALL_YES:-}"; if [[ -z "$do_install" ]] && is_tty; then echo -n "Attempt to install missing packages (${install_pkgs[*]}) via ${mgr:-<unknown>}? [y/N] " >&2; read -r do_install || true; fi; fi
+    local do_install=""
+    if [[ "${CARB_AUTOINSTALL_ASK}" == "0" ]]; then
+      do_install="no"
+    else
+      do_install="${CARB_AUTOINSTALL_YES:-}"
+      if [[ -z "$do_install" ]] && is_tty; then
+        echo -n "Attempt to install missing packages (${install_pkgs[*]}) via ${mgr:-<unknown>}? [y/N] " >&2
+        read -r do_install || true
+      fi
+    fi
     if [[ "$do_install" == "1" || "$do_install" =~ ^[Yy]$ ]]; then
       local sudo=""; [[ "${EUID:-$(id -u)}" -ne 0 && "$(command -v sudo || true)" ]] && sudo="sudo "
-      local cmd=""; case "$mgr" in
+      local cmd=""
+      case "$mgr" in
         apt)    cmd="${sudo}apt-get update && ${sudo}apt-get install -y ${install_pkgs[*]}";;
         dnf)    cmd="${sudo}dnf install -y ${install_pkgs[*]}";;
         yum)    cmd="${sudo}yum install -y ${install_pkgs[*]}";;
@@ -136,6 +224,7 @@ dep_check_and_maybe_install() {
       if [[ -n "$cmd" ]]; then bash -c "$cmd" || abort "Automatic installation failed. Please install packages manually: ${install_pkgs[*]}"; else echo "No supported package manager detected for auto-install." >&2; fi
     fi
   fi
+
   local -a still_missing=()
   for c in "${req[@]}"; do have "$c" || still_missing+=("$c"); done
   if ! have openssl && ! have shasum; then still_missing+=("openssl (or shasum)"); fi
@@ -168,9 +257,6 @@ printf 'mode=%s par2=%s r=%s s=%s cmd=%s jobs=%s\n' \
   > "${DIR_META_RUN}/carb_settings"
 printf '%s :%s:%s: %s : %s\n' "$STARTTIME" "$PWD_AT_START" "$CARB_STARTDIR" "$CARB_COMMENT" "$MODE" >> "${DIR_META_ROOT}/ingestedFolders.txt"
 
-# -------------------------------
-# Portable helpers
-# -------------------------------
 stat_epoch_mtime() { if stat -c %Y -- "$1" >/dev/null 2>&1; then stat -c %Y -- "$1"; else stat -f %m -- "$1"; fi; }
 stat_filesize() { if stat -c %s -- "$1" >/dev/null 2>&1; then stat -c %s -- "$1"; else stat -f %z -- "$1"; fi; }
 date_from_epoch() { local e="$1"; date -d @"$e" "+%Y-%m-%d_%H_%M_%S" 2>/dev/null || date -r "$e" "+%Y-%m-%d_%H_%M_%S"; }
@@ -186,7 +272,6 @@ hash_stream_sha256() {
   fi
 }
 
-# Cutoff
 TMP_REF=""
 if [[ "$MODE" == "incremental" ]]; then
   REF_EPOCH="$(stat_epoch_mtime "$REF_FILE")"
@@ -200,9 +285,6 @@ else
   sed -i.bak "s/ $MODE .*/ $MODE full/" "${DIR_META_ROOT}/ingestedFolders.txt" 2>/dev/null || true
 fi
 
-# -------------------------------
-# Recovery helpers (embedded)
-# -------------------------------
 {
 cat <<'REC'
 _select_par2_cmd() {
@@ -241,9 +323,6 @@ par2_verify_or_repair() {
 REC
 } >> "$RECOVER_SH"
 
-# -------------------------------
-# Adaptive PAR2 helpers
-# -------------------------------
 _next_pow2() {
   local n="$1"; (( n < 1 )) && { echo 1; return; }
   local p=1; while (( p < n )); do (( p <<= 1 )); done; echo "$p"
@@ -285,13 +364,8 @@ _par2_plan_for_size() {
   fi
   echo "$bs $r"
 }
-
-# EXPORT the helpers used by worker subshells
 export -f _next_pow2 _par2_plan_for_size
 
-# -------------------------------
-# PAR2 create helper (race-safe)
-# -------------------------------
 par2_create_for_blob() {
   [[ "$CARB_PAR2" == "1" ]] || return 0
   local blobpath="$1" blobname="$2" base="${DIR_PAR2}/${blobname}"
@@ -338,9 +412,6 @@ par2_create_for_blob() {
 }
 export -f par2_create_for_blob
 
-# -------------------------------
-# Per-file ingest function (worker)
-# -------------------------------
 ingest_one() {
   local src="$1"
   [[ -f "$src" ]] || return 0
@@ -433,9 +504,6 @@ export -f ingest_one abort stat_filesize hash_stream_sha256
 export TODAY DIR_TMP DIR_BLOBS DIR_META_RUN DIR_PAR2 PWD_AT_START CARB_STARTDIR \
        CARB_PAR2_CMD CARB_ENABLE_MIME CARB_PAR2 CARB_PAR2_REDUNDANCY CARB_PAR2_BLOCKSIZE
 
-# -------------------------------
-# Build find command … 
-# -------------------------------
 _trim_ws() { local s="$1"; s="${s#"${s%%[![:space:]]*}"}"; s="${s%"${s##*[![:space:]]}"}"; printf '%s' "$s"; }
 build_find_cmd() {
   local root="$1"; local -a cmd=(find "$root")
