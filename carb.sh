@@ -18,7 +18,7 @@
 #     Full backup:  carb <START_DIR>
 #                   carb <START_DIR> --full
 #
-# OUTPUT LAYOUT (relative to this script’s directory)
+# OUTPUT LAYOUT (under CARB_HOME; see below)
 #     blobs_sha256/                 # content-addressed data blobs
 #       INDEX.txt                   # appended list of blob names seen across runs
 #     blobs_par2/                   # .par2 and .vol*.par2 parity sets per blob
@@ -49,18 +49,23 @@
 #   yum, pacman, zypper, apk, brew, port) if allowed by the flags below.
 #
 # ENVIRONMENT
-#   CARB_JOBS               # worker parallelism (default: CPU cores)
-#   CARB_PAR2=0|1           # enable parity creation (default: 1)
-#   CARB_PAR2_REDUNDANCY    # % parity if fixed; else adaptive (default: 10)
-#   CARB_PAR2_BLOCKSIZE     # bytes or "auto"/"" for adaptive (default: auto)
-#   CARB_PAR2_CMD           # par2 binary name (default: par2)
-#   CARB_ENABLE_MIME=0|1    # detect MIME using 'file' (default: 1)
-#   CARB_EXCLUDE_GLOBS      # comma-separated globs to prune during find
-#   CARB_TMPDIR             # override tmp directory path
-#   CARB_AUTOINSTALL_ASK    # 1 to prompt (default), 0 to skip prompting
-#   CARB_AUTOINSTALL_YES    # non-empty or "y" to auto-yes install
-#   CARB_PKG_MANAGER        # force a package manager selection
-#   CARB_COMMENT            # freeform note stored with run metadata
+#   CARB_HOME              # storage root for all carb data (see defaults below)
+#   CARB_JOBS              # worker parallelism (default: CPU cores)
+#   CARB_PAR2=0|1          # enable parity creation (default: 1)
+#   CARB_PAR2_REDUNDANCY   # % parity if fixed; else adaptive (default: 10)
+#   CARB_PAR2_BLOCKSIZE    # bytes or "auto"/"" for adaptive (default: auto)
+#   CARB_PAR2_CMD          # par2 binary name (default: par2)
+#   CARB_ENABLE_MIME=0|1   # detect MIME using 'file' (default: 1)
+#   CARB_EXCLUDE_GLOBS     # comma-separated globs to prune during find
+#   CARB_TMPDIR            # override tmp directory path (defaults under CARB_HOME)
+#   CARB_AUTOINSTALL_ASK   # 1 to prompt (default), 0 to skip prompting
+#   CARB_AUTOINSTALL_YES   # non-empty or "y" to auto-yes install
+#   CARB_PKG_MANAGER       # force a package manager selection
+#   CARB_COMMENT           # freeform note stored with run metadata
+#
+# CARB_HOME DEFAULTS
+#   macOS:  "$HOME/Library/Application Support/carb"
+#   Linux/*BSD:  "$XDG_DATA_HOME/carb" if set, else "$HOME/.local/share/carb"
 #
 # RECOVERY
 #   Per-run recover.sh requires: CARB_RECOVER_TO_DIR=<destination>
@@ -74,9 +79,9 @@
 #   other nonzero codes may come from underlying commands; trapped to show line
 #
 # EXAMPLES
-#   Full:        CARB_COMMENT="NAS mirror" ./carb /data
-#   Incremental: ./carb /data /var/backups/last-full.marker
-#   Exclude:     CARB_EXCLUDE_GLOBS="*.tmp,.git,node_modules" ./carb ~/projects --full
+#   Full:        CARB_COMMENT="NAS mirror" carb /data
+#   Incremental: carb /data /var/backups/last-full.marker
+#   Exclude:     CARB_EXCLUDE_GLOBS="*.tmp,.git,node_modules" carb ~/projects --full
 #
 # NOTES
 #   • Content identity is (size, sha256) to avoid accidental hash collisions on
@@ -97,11 +102,16 @@ Modes:
   Full backup  : backup all files under START_DIR
 
 Environment variables:
+  CARB_HOME                 Storage root for carb data (see "CARB_HOME DEFAULTS")
   CARB_PAR2=0|1             Enable/disable PAR2 creation (default 1)
   CARB_JOBS=<n>             Number of parallel workers (default: CPU cores)
   CARB_EXCLUDE_GLOBS=<g>    Comma-separated exclusion globs
   CARB_ENABLE_MIME=0|1      MIME detection using 'file' (default 1)
   CARB_COMMENT=<text>       Optional run comment
+
+Defaults for CARB_HOME:
+  macOS:       $HOME/Library/Application Support/carb
+  Linux/*BSD:  ${XDG_DATA_HOME:-$HOME/.local/share}/carb
 
 Examples:
   carb /data
@@ -126,6 +136,7 @@ trap 'abort "line $LINENO exited with status $?"' ERR
 have() { command -v "$1" >/dev/null 2>&1; }
 is_tty() { [[ -t 0 && -t 1 ]]; }
 
+# --- Args --------------------------------------------------------------------
 if [[ $# -lt 1 || $# -gt 2 ]]; then
   echo "Usage:" >&2
   echo "  Incremental:  $0 <START_DIR> <REFERENCE_FILE>" >&2
@@ -158,6 +169,7 @@ TODAY=$(date "+%Y-%m-%d") || true
 STARTTIME=$(date "+%Y-%m-%d_%H_%M_%S") || true
 CARB_COMMENT="${CARB_COMMENT:-}"
 
+# --- Resolve script path (not used for storage anymore) ----------------------
 _resolve() { command -v readlink >/dev/null 2>&1 && readlink -f -- "$1" || python3 - "$1" <<'PY' || echo "$1"
 import os,sys
 p=sys.argv[1]
@@ -167,11 +179,33 @@ PY
 SCRIPT_PATH="$(_resolve "${BASH_SOURCE[0]}")"
 SCRIPT_BASE="$(dirname "$SCRIPT_PATH")"
 
-DIR_BLOBS="${SCRIPT_BASE}/blobs_sha256"
-DIR_TMP="${CARB_TMPDIR:-${SCRIPT_BASE}/blobs_tmp}"
-DIR_META_ROOT="${SCRIPT_BASE}/blobs_meta"
+# --- Determine CARB_HOME (store root) ---------------------------------------
+detect_os() { uname -s 2>/dev/null || echo Unknown; }
+OS="$(detect_os)"
+
+if [[ -z "${CARB_HOME:-}" ]]; then
+  if [[ "$OS" == "Darwin" ]]; then
+    # macOS: keep user-writable default without sudo, avoid /usr/local/bin
+    CARB_HOME="${HOME}/Library/Application Support/carb"
+  else
+    # Linux/*BSD: follow XDG if set
+    if [[ -n "${XDG_DATA_HOME:-}" ]]; then
+      CARB_HOME="${XDG_DATA_HOME}/carb"
+    else
+      CARB_HOME="${HOME}/.local/share/carb"
+    fi
+  fi
+fi
+
+# Make sure CARB_HOME exists
+mkdir -p -- "$CARB_HOME"
+
+# --- Storage directories (under CARB_HOME) ----------------------------------
+DIR_BLOBS="${CARB_HOME}/blobs_sha256"
+DIR_PAR2="${CARB_HOME}/blobs_par2"
+DIR_META_ROOT="${CARB_HOME}/blobs_meta"
+DIR_TMP="${CARB_TMPDIR:-${CARB_HOME}/blobs_tmp}"
 DIR_META_RUN="${DIR_META_ROOT}/v05_${STARTTIME}"
-DIR_PAR2="${SCRIPT_BASE}/blobs_par2"
 
 PWD_AT_START=$(pwd)
 
@@ -194,6 +228,7 @@ CARB_AUTOINSTALL_ASK="${CARB_AUTOINSTALL_ASK:-1}"
 CARB_AUTOINSTALL_YES="${CARB_AUTOINSTALL_YES:-}"
 CARB_PKG_MANAGER="${CARB_PKG_MANAGER:-}"
 
+# --- Dependencies ------------------------------------------------------------
 dep_check_and_maybe_install() {
   local -a missing_req=()
   local -a missing_opt=()
@@ -271,6 +306,7 @@ dep_check_and_maybe_install() {
 }
 dep_check_and_maybe_install
 
+# --- Prepare directories -----------------------------------------------------
 mkdir -p -- "$DIR_BLOBS" "$DIR_TMP" "$DIR_META_ROOT" "$DIR_META_RUN" "$DIR_PAR2" "$DIR_META_RUN/logs"
 
 : > "${DIR_META_RUN}/file_processed.txt"
@@ -284,15 +320,17 @@ chmod +x "$RECOVER_SH"
 
 printf '%s\n' "$STARTTIME"                          >> "${DIR_META_RUN}/carb_starttime"
 printf 'pwd=%s CARB_STARTDIR=%s\n' "$PWD_AT_START" "$CARB_STARTDIR" > "${DIR_META_RUN}/carb_startfolder"
-printf 'mode=%s par2=%s r=%s s=%s cmd=%s jobs=%s\n' \
-  "$MODE" "$CARB_PAR2" "$CARB_PAR2_REDUNDANCY" "${CARB_PAR2_BLOCKSIZE:-auto}" "$CARB_PAR2_CMD" "$CARB_JOBS" \
+printf 'mode=%s par2=%s r=%s s=%s cmd=%s jobs=%s home=%s\n' \
+  "$MODE" "$CARB_PAR2" "$CARB_PAR2_REDUNDANCY" "${CARB_PAR2_BLOCKSIZE:-auto}" "$CARB_PAR2_CMD" "$CARB_JOBS" "$CARB_HOME" \
   > "${DIR_META_RUN}/carb_settings"
 printf '%s :%s:%s: %s : %s\n' "$STARTTIME" "$PWD_AT_START" "$CARB_STARTDIR" "$CARB_COMMENT" "$MODE" >> "${DIR_META_ROOT}/ingestedFolders.txt"
 
+# --- Stat helpers ------------------------------------------------------------
 stat_epoch_mtime() { if stat -c %Y -- "$1" >/dev/null 2>&1; then stat -c %Y -- "$1"; else stat -f %m -- "$1"; fi; }
 stat_filesize() { if stat -c %s -- "$1" >/dev/null 2>&1; then stat -c %s -- "$1"; else stat -f %z -- "$1"; fi; }
 date_from_epoch() { local e="$1"; date -d @"$e" "+%Y-%m-%d_%H_%M_%S" 2>/dev/null || date -r "$e" "+%Y-%m-%d_%H_%M_%S"; }
 
+# --- Hash helper -------------------------------------------------------------
 hash_stream_sha256() {
   if command -v openssl >/dev/null 2>&1; then
     openssl dgst -sha256 - 2>/dev/null | awk '{print $NF}'
@@ -304,6 +342,7 @@ hash_stream_sha256() {
   fi
 }
 
+# --- Mode handling -----------------------------------------------------------
 TMP_REF=""
 if [[ "$MODE" == "incremental" ]]; then
   REF_EPOCH="$(stat_epoch_mtime "$REF_FILE")"
@@ -317,6 +356,7 @@ else
   sed -i.bak "s/ $MODE .*/ $MODE full/" "${DIR_META_ROOT}/ingestedFolders.txt" 2>/dev/null || true
 fi
 
+# --- Embed recovery helpers into recover.sh ---------------------------------
 {
 cat <<'REC'
 _select_par2_cmd() {
@@ -355,6 +395,7 @@ par2_verify_or_repair() {
 REC
 } >> "$RECOVER_SH"
 
+# --- PAR2 planning -----------------------------------------------------------
 _next_pow2() {
   local n="$1"; (( n < 1 )) && { echo 1; return; }
   local p=1; while (( p < n )); do (( p <<= 1 )); done; echo "$p"
@@ -366,49 +407,39 @@ _par2_plan_for_size() {
   local sz_dec
   sz_dec=$((10#${input}))
 
-  # Constants / defaults
   local TARGET_DATA_SLICES=16
   local MIN_PARITY_SLICES=4
   local MIN_BLOCK=512
   local MAX_BLOCK=$((4*1024*1024))
   local DEFAULT_R="${CARB_PAR2_REDUNDANCY:-10}"
 
-  # If user fixed both blocksize and redundancy, just return them
   if [[ -n "${CARB_PAR2_BLOCKSIZE:-}" && "${CARB_PAR2_BLOCKSIZE}" != "auto" && -n "${CARB_PAR2_REDUNDANCY:-}" ]]; then
     echo "${CARB_PAR2_BLOCKSIZE} ${CARB_PAR2_REDUNDANCY}"
     return
   fi
 
-  # If user fixed only the blocksize, compute a safe redundancy
   if [[ -n "${CARB_PAR2_BLOCKSIZE:-}" && "${CARB_PAR2_BLOCKSIZE}" != "auto" ]]; then
     local bs="${CARB_PAR2_BLOCKSIZE}"
     local ds=$(( (sz_dec + bs - 1) / bs )); (( ds < 1 )) && ds=1
     local r="${DEFAULT_R}"
     local ps=$(( (ds * r + 99) / 100 ))
     if (( ps < MIN_PARITY_SLICES )); then
-      r=$(( (MIN_PARITY_SLICES * 100 + ds - 1) / ds ))
-      (( r > 80 )) && r=80
+      r=$(( (MIN_PARITY_SLICES * 100 + ds - 1) / ds )); (( r > 80 )) && r=80
     fi
     echo "${bs} ${r}"
     return
   fi
 
-  # Fully automatic (adaptive) blocksize + redundancy
   local bs=$(( sz_dec / TARGET_DATA_SLICES ))
   (( bs < MIN_BLOCK )) && bs="${MIN_BLOCK}"
-  
-  # Round block size up to next power of two
-  _next_pow2() { local n="$1"; (( n < 1 )) && { echo 1; return; }; local p=1; while (( p < n )); do (( p <<= 1 )); done; echo "$p"; }
   bs="$(_next_pow2 "$bs")"
-
   (( bs > MAX_BLOCK )) && bs="${MAX_BLOCK}"
 
   local ds=$(( (sz_dec + bs - 1) / bs )); (( ds < 1 )) && ds=1
   local r="${DEFAULT_R}"
   local ps=$(( (ds * r + 99) / 100 ))
   if (( ps < MIN_PARITY_SLICES )); then
-    r=$(( (MIN_PARITY_SLICES * 100 + ds - 1) / ds ))
-    (( r > 80 )) && r=80
+    r=$(( (MIN_PARITY_SLICES * 100 + ds - 1) / ds )); (( r > 80 )) && r=80
   fi
 
   echo "${bs} ${r}"
@@ -438,8 +469,9 @@ par2_create_for_blob() {
   local bs_opt="" r_opt=""
   local s_bytes="" r_pct=""
   if [[ -z "${CARB_PAR2_BLOCKSIZE:-}" || "${CARB_PAR2_BLOCKSIZE:-}" == "auto" ]]; then
-    local fsz="${blobname%%_*}"; fsz="${fsz#0}"; [[ -z "$fsz" ]] && fsz=0
-    read -r s_bytes r_pct < <(_par2_plan_for_size "$fsz")
+    local fsz_raw="${blobname%%_*}"
+    local fsz_dec=$((10#${fsz_raw}))   # <-- force base-10 even with leading zeros
+    read -r s_bytes r_pct < <(_par2_plan_for_size "$fsz_dec")
     bs_opt="-s${s_bytes}"
     r_opt="-r${r_pct}"
   else
@@ -461,6 +493,7 @@ par2_create_for_blob() {
 }
 export -f par2_create_for_blob
 
+# --- Ingest ------------------------------------------------------------------
 ingest_one() {
   local src="$1"
   [[ -f "$src" ]] || return 0
@@ -557,6 +590,7 @@ _trim_ws() { local s="$1"; s="${s#"${s%%[![:space:]]*}"}"; s="${s%"${s##*[![:spa
 build_find_cmd() {
   local root="$1"; local -a cmd=(find "$root")
   local -a prune_paths=()
+  # Only prune if our store lives under the scanned root (often it won't)
   [[ "$DIR_BLOBS"     == "$CARB_STARTDIR"* ]] && prune_paths+=("$DIR_BLOBS")
   [[ "$DIR_META_ROOT" == "$CARB_STARTDIR"* ]] && prune_paths+=("$DIR_META_ROOT")
   [[ "$DIR_PAR2"      == "$CARB_STARTDIR"* ]] && prune_paths+=("$DIR_PAR2")
@@ -578,6 +612,7 @@ CMD_ARR=()
 while IFS= read -r -d '' part; do CMD_ARR+=("$part"); done < <(build_find_cmd "$CARB_STARTDIR")
 "${CMD_ARR[@]}" | xargs -0 -I{} -n1 -P "${CARB_JOBS}" bash -c 'ingest_one "$@"' _ {}
 
+# --- Collate logs ------------------------------------------------------------
 LOGDIR="${DIR_META_RUN}/logs"
 find "$LOGDIR" -type f -name '*_processed.txt' -exec cat {} + >> "${DIR_META_RUN}/file_processed.txt" 2>/dev/null || true
 find "$LOGDIR" -type f -name '*_skipped.txt'   -exec cat {} + >> "${DIR_META_RUN}/file_skipped.txt"   2>/dev/null || true
