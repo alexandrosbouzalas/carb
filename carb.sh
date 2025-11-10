@@ -361,40 +361,57 @@ _next_pow2() {
 }
 
 _par2_plan_for_size() {
-  local sz="$1"
-  if [[ -n "${CARB_PAR2_BLOCKSIZE:-}" && "${CARB_PAR2_BLOCKSIZE:-}" != "auto" && -n "${CARB_PAR2_REDUNDANCY:-}" ]]; then
-    echo "$CARB_PAR2_BLOCKSIZE $CARB_PAR2_REDUNDANCY"; return
-  fi
+  # Force decimal even if the size string has leading zeros (e.g. 000...018)
+  local input="${1:-0}"
+  local sz_dec
+  sz_dec=$((10#${input}))
+
+  # Constants / defaults
   local TARGET_DATA_SLICES=16
   local MIN_PARITY_SLICES=4
   local MIN_BLOCK=512
   local MAX_BLOCK=$((4*1024*1024))
   local DEFAULT_R="${CARB_PAR2_REDUNDANCY:-10}"
 
-  if [[ -n "${CARB_PAR2_BLOCKSIZE:-}" && "${CARB_PAR2_BLOCKSIZE:-}" != "auto" ]]; then
+  # If user fixed both blocksize and redundancy, just return them
+  if [[ -n "${CARB_PAR2_BLOCKSIZE:-}" && "${CARB_PAR2_BLOCKSIZE}" != "auto" && -n "${CARB_PAR2_REDUNDANCY:-}" ]]; then
+    echo "${CARB_PAR2_BLOCKSIZE} ${CARB_PAR2_REDUNDANCY}"
+    return
+  fi
+
+  # If user fixed only the blocksize, compute a safe redundancy
+  if [[ -n "${CARB_PAR2_BLOCKSIZE:-}" && "${CARB_PAR2_BLOCKSIZE}" != "auto" ]]; then
     local bs="${CARB_PAR2_BLOCKSIZE}"
-    local ds=$(( (sz + bs - 1) / bs )); (( ds < 1 )) && ds=1
+    local ds=$(( (sz_dec + bs - 1) / bs )); (( ds < 1 )) && ds=1
     local r="${DEFAULT_R}"
     local ps=$(( (ds * r + 99) / 100 ))
     if (( ps < MIN_PARITY_SLICES )); then
-      r=$(( (MIN_PARITY_SLICES * 100 + ds - 1) / ds )); (( r > 80 )) && r=80
+      r=$(( (MIN_PARITY_SLICES * 100 + ds - 1) / ds ))
+      (( r > 80 )) && r=80
     fi
-    echo "$bs $r"; return
+    echo "${bs} ${r}"
+    return
   fi
 
-  local bs=$(( sz / TARGET_DATA_SLICES ))
-  (( bs < MIN_BLOCK )) && bs="$MIN_BLOCK"
+  # Fully automatic (adaptive) blocksize + redundancy
+  local bs=$(( sz_dec / TARGET_DATA_SLICES ))
+  (( bs < MIN_BLOCK )) && bs="${MIN_BLOCK}"
+  
+  # Round block size up to next power of two
+  _next_pow2() { local n="$1"; (( n < 1 )) && { echo 1; return; }; local p=1; while (( p < n )); do (( p <<= 1 )); done; echo "$p"; }
   bs="$(_next_pow2 "$bs")"
-  (( bs > MAX_BLOCK )) && bs="$MAX_BLOCK"
-  (( bs < 1 )) && bs=1
 
-  local ds=$(( (sz + bs - 1) / bs )); (( ds < 1 )) && ds=1
+  (( bs > MAX_BLOCK )) && bs="${MAX_BLOCK}"
+
+  local ds=$(( (sz_dec + bs - 1) / bs )); (( ds < 1 )) && ds=1
   local r="${DEFAULT_R}"
   local ps=$(( (ds * r + 99) / 100 ))
   if (( ps < MIN_PARITY_SLICES )); then
-    r=$(( (MIN_PARITY_SLICES * 100 + ds - 1) / ds )); (( r > 80 )) && r=80
+    r=$(( (MIN_PARITY_SLICES * 100 + ds - 1) / ds ))
+    (( r > 80 )) && r=80
   fi
-  echo "$bs $r"
+
+  echo "${bs} ${r}"
 }
 export -f _next_pow2 _par2_plan_for_size
 

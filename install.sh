@@ -4,7 +4,7 @@
 set -Eeuo pipefail
 
 # --- Settings ---------------------------------------------------------------
-PREFIX="${PREFIX:-}"          # optional override: PREFIX=/opt/mytools bash install.sh
+PREFIX="${PREFIX:-}"          # optional override: PREFIX=/opt/mytools/carb bash install.sh
 BIN_NAME="carb"
 SRC_BIN="carb.sh"
 SRC_MAN="carb.1"
@@ -21,15 +21,23 @@ if [ ! -f "$SRC_MAN_PATH" ]; then echo "ERROR: $SRC_MAN not found at $SRC_MAN_PA
 OS="$(uname -s || echo Unknown)"
 case "$OS" in
   Darwin)
-    if command -v brew >/dev/null 2>&1; then
-      DEFAULT_PREFIX="$(brew --prefix 2>/dev/null || echo /usr/local)"
+    # Always prefer a dedicated /carb subfolder under the usual roots.
+    if [ -d /opt/homebrew ]; then
+      DEFAULT_PREFIX="/opt/homebrew/carb"
     else
-      if [ -d /opt/homebrew ]; then DEFAULT_PREFIX="/opt/homebrew"; else DEFAULT_PREFIX="/usr/local"; fi
+      DEFAULT_PREFIX="/usr/local/carb"
     fi
     ;;
-  Linux|*BSD*) DEFAULT_PREFIX="/usr/local" ;;
-  *) DEFAULT_PREFIX="/usr/local"; echo "WARN: Unrecognized OS '$OS'. Using $DEFAULT_PREFIX." ;;
+  Linux|*BSD*)
+    DEFAULT_PREFIX="/usr/local/carb"
+    ;;
+  *)
+    DEFAULT_PREFIX="/usr/local/carb"
+    echo "WARN: Unrecognized OS '$OS'. Using $DEFAULT_PREFIX."
+    ;;
 esac
+
+# Allow user override via PREFIX env, otherwise use default
 PREFIX="${PREFIX:-$DEFAULT_PREFIX}"
 
 DEST_BIN_DIR="${PREFIX}/bin"
@@ -80,6 +88,7 @@ refresh_man_db() {
 echo "==> Installing to prefix: $PREFIX"
 echo "    bin: $DEST_BIN_DIR"
 echo "    man: $DEST_MAN_DIR"
+echo "    note: backups produced by 'carb' will live under this tree (next to the binary)."
 
 # Determine writability of target dirs or their parents
 BIN_DIR_WRITABLE="no"; is_writable_dir "$DEST_BIN_DIR" && BIN_DIR_WRITABLE="yes"
