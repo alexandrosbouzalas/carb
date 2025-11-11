@@ -63,9 +63,41 @@ parity exists; otherwise it copies bytes as\-is. Restores are performed
 \fIrelative\fR to the snapshot root: files are recreated under
 \fBCARB_RECOVER_TO_DIR\fR/\fI<basename_of_START_DIR>\fR/\fI<relative_path>\fR.
 .PP
+Recovery supports two modes:
+.TP
+\fB\-\-all\fR  (default)
+Restore every file recorded in the snapshot (verify/repair where parity is present).
+.TP
+\fB\-\-damaged\fR
+Only restore files that fail a PAR2 verify step (attempt repair if possible; otherwise copy bytes).
+.PP
+You can also select the mode via environment variable:
+.IP
+\fBCARB_RECOVER_MODE\fR=\fIall\fR|\fIdamaged\fR
+.PP
+Flags take precedence over the environment variable.
+.PP
 The footer includes a guard that exits cleanly when no files were recorded in
 the snapshot. The script is robust to being invoked as \fB./recover.sh\fR or
 via \fBbash recover.sh\fR.
+.SH OPTIONS
+.TP
+\fB\-\-full\fR
+Ingest all files under \fISTART_DIR\fR (full backup mode).
+.TP
+\fB\-\-help\fR
+Show a brief usage summary.
+.TP
+\fB\-\-version\fR
+Show version and exit.
+.PP
+(Recovery script options:)
+.TP
+\fB\-\-all\fR
+Restore all files in the snapshot (default).
+.TP
+\fB\-\-damaged\fR
+Restore only files that fail PAR2 verification.
 .SH DEPENDENCIES
 Required: \fBfind\fR, \fBxargs\fR, \fBawk\fR, \fBsed\fR, \fBtee\fR, \fBmktemp\fR, \fBln\fR, \fBcp\fR, \fBstat\fR, \fBdate\fR,
 \fBopenssl\fR (or \fBshasum\fR).
@@ -124,6 +156,9 @@ Freeform note stored with run metadata.
 .TP
 \fBCARB_RECOVER_TO_DIR\fR
 \fI(used only by recover.sh)\fR Destination root for restore.
+.TP
+\fBCARB_RECOVER_MODE\fR=\fIall\fR|\fIdamaged\fR
+\fI(used only by recover.sh)\fR Select restore strategy (flags override).
 .SH EXIT STATUS
 0 on success; non\-zero on error. The generated \fBrecover.sh\fR exits 0 when
 there are no files to restore.
@@ -135,8 +170,12 @@ there are no files to restore.
 .br
 \fBCARB_EXCLUDE_GLOBS\fR=".git,node_modules" \fBcarb\fR ~/projects \-\-full
 .br
-# restore example (run from a specific metadata snapshot directory):
+# restore all files from a specific snapshot:
 .br
-\fBCARB_RECOVER_TO_DIR\fR=~/restore bash \fIblobs_meta/v05_YYYY\-MM\-DD_HH_MM_SS\fR/recover.sh
+\fBCARB_RECOVER_TO_DIR\fR=~/restore bash \fIblobs_meta/v05_YYYY\-MM\-DD_HH_MM_SS\fR/recover.sh \-\-all
+.br
+# restore only damaged files:
+.br
+\fBCARB_RECOVER_TO_DIR\fR=~/restore CARB_RECOVER_MODE=damaged bash \fIblobs_meta/v05_YYYY\-MM\-DD_HH_MM_SS\fR/recover.sh
 .SH SEE ALSO
 par2(1), par2create(1), file(1), shasum(1), openssl(1), find(1)

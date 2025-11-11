@@ -1,6 +1,72 @@
 #!/usr/bin/env bash
 #------------------------------------------------------------------------------
 # carb — Content-addressable robust backup + per-file ingester with PAR2
+#
+# OVERVIEW
+#   Scans a start directory, ingests every regular file, and stores its bytes
+#   once under a content-addressable blob name "<padded_size>_<sha256>.data".
+#   Subsequent duplicates hardlink to the same blob. A per-run metadata folder
+#   records provenance, stats, MIME types (optional), and generates a recovery
+#   script that can verify/repair bytes with PAR2 and restore original paths.
+#
+#   Modes:
+#     • Full         — ingest all files found under START_DIR
+#     • Incremental  — ingest only files newer than a reference file’s mtime
+#
+# USAGE
+#     Incremental:  carb <START_DIR> <REFERENCE_FILE>
+#     Full backup:  carb <START_DIR>
+#                   carb <START_DIR> --full
+#
+# OUTPUT LAYOUT (under CARB_HOME; see below)
+#     blobs_sha256/                 # content-addressed data blobs
+#       INDEX.txt                   # appended list of blob names seen across runs
+#     blobs_par2/                   # .par2 and .vol*.par2 parity sets per blob
+#     blobs_tmp/                    # temporary workspace
+#     blobs_meta/
+#       v05_<YYYY-MM-DD_HH_MM_SS>/  # per-run metadata + logs
+#         file_processed.txt        # blobname:cwd:startdir:absolute_path (all seen)
+#         file_skipped.txt          # lines for files deduped by existing blob
+#         file_ingested.txt         # lines for files that produced/linked blob
+#         file_stat1.txt            # portable stat summary
+#         file_stat2.txt            # native stat summary
+#         file_types2.csv           # "blobname","mime-type" (if enabled)
+#         par2_created.txt          # blobnames with emitted PAR2
+#         recover.sh                # self-contained recovery helper
+#         carb_starttime            # run timestamp
+#         carb_startfolder          # original PWD and normalized start dir
+#         carb_settings             # run settings (mode, par2 params, jobs, home)
+#     blobs_meta/ingestedFolders.txt # append-only log of ingested roots
+#
+# DEPENDENCIES
+#   Required:  find, xargs, awk, sed, tee, mktemp, ln, cp, stat, date,
+#              openssl (or shasum)
+#   Optional:  file (for MIME detection)
+#   If PAR2 on: par2cmdline (par2create/par2)
+#
+# ENVIRONMENT
+#   CARB_HOME              # storage root for all carb data (see defaults below)
+#   CARB_JOBS              # worker parallelism (default: CPU cores)
+#   CARB_PAR2=0|1          # enable parity creation (default: 1)
+#   CARB_PAR2_REDUNDANCY   # % parity if fixed; else adaptive (default: 10)
+#   CARB_PAR2_BLOCKSIZE    # bytes or "auto"/"" for adaptive (default: auto)
+#   CARB_PAR2_CMD          # par2 binary name (default: par2)
+#   CARB_ENABLE_MIME=0|1   # detect MIME using 'file' (default: 1)
+#   CARB_EXCLUDE_GLOBS     # comma-separated globs to prune during find
+#   CARB_TMPDIR            # override tmp directory path (defaults under CARB_HOME)
+#   CARB_AUTOINSTALL_ASK   # 1 to prompt (default), 0 to skip prompting
+#   CARB_AUTOINSTALL_YES   # non-empty or "y" to auto-yes install
+#   CARB_PKG_MANAGER       # force a package manager selection
+#   CARB_COMMENT           # freeform note stored with run metadata
+#
+# CARB_HOME DEFAULTS
+#   macOS:       "$HOME/Library/Application Support/carb"
+#   Linux/*BSD:  "$XDG_DATA_HOME/carb" if set, else "$HOME/.local/share/carb"
+#
+# RECOVERY
+#   Per-run recover.sh requires: CARB_RECOVER_TO_DIR=<destination>
+#   It verifies/repairs bytes with PAR2 if available and recreates paths.
+#   Modes (env or CLI): CARB_RECOVER_MODE=all|damaged  or  --all / --damaged
 #------------------------------------------------------------------------------
 
 if [[ "${1-}" == "--help" ]]; then
@@ -15,7 +81,7 @@ Modes:
   Full backup  : backup all files under START_DIR
 
 Environment variables:
-  CARB_HOME                 Storage root for carb data (see "CARB_HOME DEFAULTS")
+  CARB_HOME                 Storage root for carb data (see defaults)
   CARB_PAR2=0|1             Enable/disable PAR2 creation (default 1)
   CARB_JOBS=<n>             Number of parallel workers (default: CPU cores)
   CARB_EXCLUDE_GLOBS=<g>    Comma-separated exclusion globs
@@ -63,7 +129,6 @@ startdir_from_arg() {
 }
 CARB_STARTDIR="$(startdir_from_arg "$START_ARG")"
 [[ -d "$CARB_STARTDIR" ]] || abort "Start directory does not exist: $CARB_STARTDIR"
-CARB_START_BASENAME="$(basename -- "$CARB_STARTDIR")"
 
 MODE="incremental"
 if [[ $# -eq 1 || "$REF_OR_FLAG" == "--full" ]]; then
@@ -77,7 +142,17 @@ TODAY=$(date "+%Y-%m-%d") || true
 STARTTIME=$(date "+%Y-%m-%d_%H_%M_%S") || true
 CARB_COMMENT="${CARB_COMMENT:-}"
 
-# --- CARB_HOME ---------------------------------------------------------------
+# --- Resolve script path (not used for storage anymore) ----------------------
+_resolve() { command -v readlink >/dev/null 2>&1 && readlink -f -- "$1" || python3 - "$1" <<'PY' || echo "$1"
+import os,sys
+p=sys.argv[1]
+print(os.path.abspath(os.path.realpath(p)))
+PY
+}
+SCRIPT_PATH="$(_resolve "${BASH_SOURCE[0]}")"
+SCRIPT_BASE="$(dirname "$SCRIPT_PATH")"
+
+# --- Determine CARB_HOME (store root) ---------------------------------------
 detect_os() { uname -s 2>/dev/null || echo Unknown; }
 OS="$(detect_os)"
 
@@ -85,12 +160,17 @@ if [[ -z "${CARB_HOME:-}" ]]; then
   if [[ "$OS" == "Darwin" ]]; then
     CARB_HOME="${HOME}/Library/Application Support/carb"
   else
-    CARB_HOME="${XDG_DATA_HOME:-$HOME/.local/share}/carb"
+    if [[ -n "${XDG_DATA_HOME:-}" ]]; then
+      CARB_HOME="${XDG_DATA_HOME}/carb"
+    else
+      CARB_HOME="${HOME}/.local/share/carb"
+    fi
   fi
 fi
+
 mkdir -p -- "$CARB_HOME"
 
-# --- Storage directories -----------------------------------------------------
+# --- Storage directories (under CARB_HOME) ----------------------------------
 DIR_BLOBS="${CARB_HOME}/blobs_sha256"
 DIR_PAR2="${CARB_HOME}/blobs_par2"
 DIR_META_ROOT="${CARB_HOME}/blobs_meta"
@@ -202,7 +282,7 @@ mkdir -p -- "$DIR_BLOBS" "$DIR_TMP" "$DIR_META_ROOT" "$DIR_META_RUN" "$DIR_PAR2"
 : > "${DIR_META_RUN}/file_ingested.txt"
 : > "${DIR_BLOBS}/INDEX.txt"
 
-# --- Create recover.sh (relative restore; inline work-lines; BSD/GNU safe) ---
+# --- Create recover.sh (TTY-friendly, supports modes) ------------------------
 RECOVER_SH="${DIR_META_RUN}/recover.sh"
 {
   cat <<'HDR'
@@ -227,6 +307,39 @@ else
 fi
 CHECK="✅"; WRENCH="🛠️"; CROSS="❌"; INFO="ℹ️"
 
+# Two restore modes: env + CLI flags
+# - Env: CARB_RECOVER_MODE=all|damaged   (default: all)
+# - CLI: --all | --damaged (overrides env)
+MODE="${CARB_RECOVER_MODE:-all}"
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --all)     MODE="all"; shift ;;
+    --damaged) MODE="damaged"; shift ;;
+    -h|--help)
+      cat <<USAGE
+Usage:
+  CARB_RECOVER_TO_DIR=/target [CARB_RECOVER_MODE=all|damaged] bash recover.sh [--all|--damaged]
+
+Modes:
+  --all       Restore all files recorded in this snapshot (default).
+  --damaged   Restore only entries whose blob fails PAR2 verify (then repair/copy).
+
+Notes:
+  CLI flags override the environment variable.
+USAGE
+      exit 0
+      ;;
+    *)
+      echo "Unknown option: $1 (use --all, --damaged, or --help)" >&2
+      exit 64
+      ;;
+  esac
+done
+if [[ "$MODE" != "all" && "$MODE" != "damaged" ]]; then
+  echo "Invalid mode: '$MODE' (expected 'all' or 'damaged')." >&2
+  exit 64
+fi
+
 _select_par2_cmd() {
   local want="${CARB_PAR2_CMD:-}"
   if [[ -n "$want" ]] && command -v "$want" >/dev/null 2>&1; then printf '%s\n' "$want"; return 0; fi
@@ -235,59 +348,79 @@ _select_par2_cmd() {
   printf '\n'
 }
 
-_ok=0; _repaired=0; _copied_no_par2=0; _failed=0; _total=0
+_ok=0; _repaired=0; _copied_no_par2=0; _failed=0; _total=0; _skipped_clean=0; _skipped_no_par2=0
 
+# returns: 0 copied/acted, 10 verified-clean-and-skipped, 11 no-par2-and-skipped
 par2_verify_or_repair_verbose() {
   local src="$1" dest="$2" pardir="$3" blobname="$4" prefer="$5"
   local base="${pardir}/${blobname}"
   local cmd="$prefer"
   [[ -n "$cmd" ]] || cmd="$(_select_par2_cmd)"
-  ((++_total))
 
+  # no parity available
   if ! ls -1 "${base}.par2" "${base}".vol*.par2 >/dev/null 2>&1; then
-    mkdir -p "$(dirname "$dest")"
-    cp "$src" "$dest"
-    ((++_copied_no_par2))
+    if [[ "$MODE" == "damaged" ]]; then
+      ((_skipped_no_par2++))
+      echo "${YELLOW}${INFO}${RESET} ${blobname} (no PAR2); ${DIM}skipping in damaged-mode${RESET}"
+      return 11
+    fi
+    mkdir -p -- "$(dirname -- "$dest")"
+    cp -- "$src" "$dest"
+    ((_copied_no_par2++)); ((_total++))
     echo "${BLUE}${INFO}${RESET} ${DIM}${blobname}${RESET} → ${dest}  (no PAR2, copied)"
     return 0
   fi
 
+  # have parity -> verify/repair flow
   if [[ -n "$cmd" ]] && command -v "$cmd" >/dev/null 2>&1; then
     if "$cmd" verify -q -B / "${base}.par2" -- "$src" >/dev/null 2>&1; then
-      mkdir -p "$(dirname "$dest")"
-      cp "$src" "$dest"
-      ((++_ok))
+      if [[ "$MODE" == "damaged" ]]; then
+        ((_skipped_clean++))
+        echo "${DIM}skip clean${RESET} ${blobname}"
+        return 10
+      fi
+      mkdir -p -- "$(dirname -- "$dest")"
+      cp -- "$src" "$dest"
+      ((_ok++)); ((_total++))
       echo "${GREEN}${CHECK}${RESET} ${DIM}${blobname}${RESET} verified → ${dest}"
       return 0
     fi
+    # not clean -> attempt repair
     if "$cmd" repair -q -B / "${base}.par2" -- "$src" >/dev/null 2>&1; then
       "$cmd" verify -q -B / "${base}.par2" -- "$src" >/dev/null 2>&1 || true
-      mkdir -p "$(dirname "$dest")"
-      cp "$src" "$dest"
-      ((++_repaired))
+      mkdir -p -- "$(dirname -- "$dest")"
+      cp -- "$src" "$dest"
+      ((_repaired++)); ((_total++))
       echo "${YELLOW}${WRENCH}${RESET} ${DIM}${blobname}${RESET} repaired → ${dest}"
       return 0
     fi
-    mkdir -p "$(dirname "$dest")"
-    cp "$src" "$dest"
-    ((++_failed))
+    mkdir -p -- "$(dirname -- "$dest")"
+    cp -- "$src" "$dest"
+    ((_failed++)); ((_total++))
     echo "${RED}${CROSS}${RESET} ${DIM}${blobname}${RESET} repair failed; copied bytes as-is → ${dest}"
+    return 0
   else
-    mkdir -p "$(dirname "$dest")"
-    cp "$src" "$dest"
-    ((++_copied_no_par2))
+    if [[ "$MODE" == "damaged" ]]; then
+      ((_skipped_no_par2++))
+      echo "${YELLOW}${INFO}${RESET} ${blobname} (par2 tool missing); ${DIM}skipping in damaged-mode${RESET}"
+      return 11
+    fi
+    mkdir -p -- "$(dirname -- "$dest")"
+    cp -- "$src" "$dest"
+    ((_copied_no_par2++)); ((_total++))
     echo "${BLUE}${INFO}${RESET} ${DIM}${blobname}${RESET} par2 tool missing; copied → ${dest}"
+    return 0
   fi
 }
 
 recover_one() {
   local src="$1" rel="$2" pardir="$3" blobname="$4" prefer="$5"
   local dest="${CARB_RECOVER_TO_DIR}/${CARB_START_BASENAME}/${rel}"
-  par2_verify_or_repair_verbose "$src" "$dest" "$pardir" "$blobname" "$prefer"
+  par2_verify_or_repair_verbose "$src" "$dest" "$pardir" "$blobname" "$prefer" || true
 }
 HDR
   echo "CARB_STARTDIR_RUN=\"${CARB_STARTDIR}\""
-  echo "CARB_START_BASENAME=\"${CARB_START_BASENAME}\""
+  echo "CARB_START_BASENAME=\"$(basename -- "${CARB_STARTDIR}")\""
   echo "RUN_TIMESTAMP=\"${STARTTIME}\""
   cat <<'HDR2'
 
@@ -299,6 +432,7 @@ HDR2
 } > "$RECOVER_SH"
 chmod +x "$RECOVER_SH"
 
+# --- Record settings & run header -------------------------------------------
 printf '%s\n' "$STARTTIME"                          >> "${DIR_META_RUN}/carb_starttime"
 printf 'pwd=%s CARB_STARTDIR=%s\n' "$PWD_AT_START" "$CARB_STARTDIR" > "${DIR_META_RUN}/carb_startfolder"
 printf 'mode=%s par2=%s r=%s s=%s cmd=%s jobs=%s home=%s\n' \
@@ -338,16 +472,11 @@ else
 fi
 
 # --- PAR2 planning -----------------------------------------------------------
-_next_pow2() {
-  local n="$1"; (( n < 1 )) && { echo 1; return; }
-  local p=1; while (( p < n )); do (( p <<= 1 )); done; echo "$p"
-}
+_next_pow2() { local n="$1"; (( n < 1 )) && { echo 1; return; }; local p=1; while (( p < n )); do (( p <<= 1 )); done; echo "$p"; }
 
 _par2_plan_for_size() {
   local input="${1:-0}"
-  local sz_dec
-  sz_dec=$((10#${input}))
-
+  local sz_dec; sz_dec=$((10#${input}))
   local TARGET_DATA_SLICES=16
   local MIN_PARITY_SLICES=4
   local MIN_BLOCK=512
@@ -355,34 +484,24 @@ _par2_plan_for_size() {
   local DEFAULT_R="${CARB_PAR2_REDUNDANCY:-10}"
 
   if [[ -n "${CARB_PAR2_BLOCKSIZE:-}" && "${CARB_PAR2_BLOCKSIZE}" != "auto" && -n "${CARB_PAR2_REDUNDANCY:-}" ]]; then
-    echo "${CARB_PAR2_BLOCKSIZE} ${CARB_PAR2_REDUNDANCY}"
-    return
+    echo "${CARB_PAR2_BLOCKSIZE} ${CARB_PAR2_REDUNDANCY}"; return
   fi
-
   if [[ -n "${CARB_PAR2_BLOCKSIZE:-}" && "${CARB_PAR2_BLOCKSIZE}" != "auto" ]]; then
     local bs="${CARB_PAR2_BLOCKSIZE}"
     local ds=$(( (sz_dec + bs - 1) / bs )); (( ds < 1 )) && ds=1
     local r="${DEFAULT_R}"
     local ps=$(( (ds * r + 99) / 100 ))
-    if (( ps < MIN_PARITY_SLICES )); then
-      r=$(( (MIN_PARITY_SLICES * 100 + ds - 1) / ds )); (( r > 80 )) && r=80
-    fi
-    echo "${bs} ${r}"
-    return
+    if (( ps < MIN_PARITY_SLICES )); then r=$(( (MIN_PARITY_SLICES * 100 + ds - 1) / ds )); (( r > 80 )) && r=80; fi
+    echo "${bs} ${r}"; return
   fi
-
   local bs=$(( sz_dec / TARGET_DATA_SLICES ))
   (( bs < MIN_BLOCK )) && bs="${MIN_BLOCK}"
   bs="$(_next_pow2 "$bs")"
   (( bs > MAX_BLOCK )) && bs="${MAX_BLOCK}"
-
   local ds=$(( (sz_dec + bs - 1) / bs )); (( ds < 1 )) && ds=1
   local r="${DEFAULT_R}"
   local ps=$(( (ds * r + 99) / 100 ))
-  if (( ps < MIN_PARITY_SLICES )); then
-    r=$(( (MIN_PARITY_SLICES * 100 + ds - 1) / ds )); (( r > 80 )) && r=80
-  fi
-
+  if (( ps < MIN_PARITY_SLICES )); then r=$(( (MIN_PARITY_SLICES * 100 + ds - 1) / ds )); (( r > 80 )) && r=80; fi
   echo "${bs} ${r}"
 }
 export -f _next_pow2 _par2_plan_for_size
@@ -391,7 +510,6 @@ par2_create_for_blob() {
   [[ "$CARB_PAR2" == "1" ]] || return 0
   local blobpath="$1" blobname="$2" base="${DIR_PAR2}/${blobname}"
   local cmd="$CARB_PAR2_CMD"
-
   if ! command -v "$cmd" >/dev/null 2>&1; then
     if command -v par2create >/dev/null 2>&1; then cmd=par2create
     elif command -v par2 >/dev/null 2>&1; then cmd=par2
@@ -409,22 +527,17 @@ par2_create_for_blob() {
 
   local bs_opt="" r_opt=""
   local s_bytes="" r_pct=""
-  if [[ -z "${CARB_PAR2_BLOCKSIZE:-}" || "${CARB_PAR2_BLOCKSIZE:-}" == "auto" ]]; then
+  if [[ -z "${CARB_PAR2_BLOCKSIZE:-}" || "${CARB_PAR2_BLOCKSIZE}" == "auto" ]]; then
     local fsz_raw="${blobname%%_*}"
     local fsz_dec=$((10#${fsz_raw}))
     read -r s_bytes r_pct < <(_par2_plan_for_size "$fsz_dec")
-    bs_opt="-s${s_bytes}"
-    r_opt="-r${r_pct}"
+    bs_opt="-s${s_bytes}"; r_opt="-r${r_pct}"
   else
     [[ -n "${CARB_PAR2_BLOCKSIZE:-}"  ]] && bs_opt="-s${CARB_PAR2_BLOCKSIZE}"
-    local r_use="${CARB_PAR2_REDUNDANCY:-10}"
-    r_opt="-r${r_use}"
+    local r_use="${CARB_PAR2_REDUNDANCY:-10}"; r_opt="-r${r_use}"
   fi
 
-  local args=(-q -B /)
-  [[ -n "$r_opt" ]] && args+=("$r_opt")
-  [[ -n "$bs_opt" ]] && args+=("$bs_opt")
-
+  local args=(-q -B /); [[ -n "$r_opt" ]] && args+=("$r_opt"); [[ -n "$bs_opt" ]] && args+=("$bs_opt")
   if "$cmd" create "${args[@]}" "${base}.par2" -- "$blobpath" 2>>"${DIR_META_RUN}/par2.stderr"; then
     printf '%s\n' "${blobname}" >> "${DIR_META_RUN}/par2_created.txt"
   else
@@ -518,18 +631,18 @@ ingest_one() {
     fi
   fi
 
-  # Inline per-file recovery line (relative under CARB_STARTDIR)
+  # Generate per-file recovery line (relative under CARB_STARTDIR)
   local rel="${abs#${CARB_STARTDIR}}"
-  rel="${rel#/}"
+  rel="${rel#/}"  # drop a leading slash if present
   printf 'recover_one "%s" "%s" "%s" "%s" "%s"\n' \
     "$blobpath" "$rel" "$DIR_PAR2" "$blobname" "$CARB_PAR2_CMD" >> "$LOG_RECOV"
 }
 
 export -f ingest_one abort stat_filesize hash_stream_sha256
 export TODAY DIR_TMP DIR_BLOBS DIR_META_RUN DIR_PAR2 PWD_AT_START CARB_STARTDIR \
-       CARB_PAR2_CMD CARB_ENABLE_MIME CARB_PAR2 CARB_PAR2_REDUNDANCY CARB_PAR2_BLOCKSIZE \
-       CARB_START_BASENAME
+       CARB_PAR2_CMD CARB_ENABLE_MIME CARB_PAR2 CARB_PAR2_REDUNDANCY CARB_PAR2_BLOCKSIZE
 
+# --- Build the find command (prunes carb’s own dirs if scanning inside start) -
 _trim_ws() { local s="$1"; s="${s#"${s%%[![:space:]]*}"}"; s="${s%"${s##*[![:space:]]}"}"; printf '%s' "$s"; }
 build_find_cmd() {
   local root="$1"; local -a cmd=(find "$root")
@@ -551,11 +664,12 @@ build_find_cmd() {
   printf '%s\0' "${cmd[@]}"
 }
 
+# --- Walk & ingest -----------------------------------------------------------
 CMD_ARR=()
 while IFS= read -r -d '' part; do CMD_ARR+=("$part"); done < <(build_find_cmd "$CARB_STARTDIR")
 "${CMD_ARR[@]}" | xargs -0 -I{} -n1 -P "${CARB_JOBS}" bash -c 'ingest_one "$@"' _ {}
 
-# --- Collate logs into run files --------------------------------------------
+# --- Collate logs ------------------------------------------------------------
 LOGDIR="${DIR_META_RUN}/logs"
 find "$LOGDIR" -type f -name '*_processed.txt' -exec cat {} + >> "${DIR_META_RUN}/file_processed.txt" 2>/dev/null || true
 find "$LOGDIR" -type f -name '*_skipped.txt'   -exec cat {} + >> "${DIR_META_RUN}/file_skipped.txt"   2>/dev/null || true
@@ -565,12 +679,13 @@ find "$LOGDIR" -type f -name '*_stat2.txt'     -exec cat {} + >> "${DIR_META_RUN
 find "$LOGDIR" -type f -name '*_types.csv'     -exec cat {} + >> "${DIR_META_RUN}/file_types2.csv"    2>/dev/null || true
 find "$LOGDIR" -type f -name '*_recover.sh'    -exec cat {} + >> "$RECOVER_SH"                        2>/dev/null || true
 
-# --- Guard + summary footer --------------------------------------------------
+# Append a guard + summary footer to recover.sh
 {
   cat <<'FOOT'
-# If no work-lines were appended, say so clearly and exit 0 (not an error).
-if ! grep -qE '^recover_one ' "${BASH_SOURCE[0]:-$0}" 2>/dev/null; then
-  echo "No files recorded in this snapshot (nothing to restore)."
+# If no work-lines were appended, let the user know.
+SELF="${BASH_SOURCE[0]:-$0}"
+if ! grep -qE '^recover_one ' "$SELF" 2>/dev/null; then
+  echo "No files recorded in this snapshot (nothing to restore)." >&2
   exit 0
 fi
 
@@ -582,15 +697,18 @@ echo "  verified:  ${_ok}    ${CHECK}"
 echo "  repaired:  ${_repaired}  ${WRENCH}"
 echo "  no-par2:   ${_copied_no_par2}  ${INFO}"
 echo "  failed:    ${_failed}  ${CROSS}"
+echo "  skipped(clean): ${_skipped_clean}"
+echo "  skipped(no-par2): ${_skipped_no_par2}"
 echo "----------------------------------------"
 FOOT
 } >> "$RECOVER_SH"
 
-# --- Index + final console summary ------------------------------------------
+# --- Update blob index -------------------------------------------------------
 awk -F: '{print $1}' "${DIR_META_RUN}/file_ingested.txt" | sort -u >> "${DIR_META_RUN}/INDEX_NEW.txt" || true
 cat "${DIR_META_RUN}/INDEX_NEW.txt" >> "${DIR_BLOBS}/INDEX.txt" 2>/dev/null || true
 
-echo "Run metadata:"; printf 'pwd=%s CARB_STARTDIR=%s\n' "$PWD_AT_START" "$CARB_STARTDIR"
+# --- Epilogue ----------------------------------------------------------------
+echo "Run metadata:"; cat "${DIR_META_RUN}/carb_startfolder" || true
 count_file_lines() { [[ -f "$1" ]] && wc -l < "$1" || echo 0; }
 echo "$(count_file_lines "${DIR_META_RUN}/file_processed.txt") files in file_processed.txt"
 echo "$(count_file_lines "${DIR_META_RUN}/file_skipped.txt")   files in file_skipped.txt"

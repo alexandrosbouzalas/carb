@@ -162,7 +162,9 @@ printf '\x00' | dd of="${BLOB_DIR}/${VICTIM_BLOB}" bs=1 seek=64 count=1 conv=not
 
 rm -rf "$WORKDIR/restore_repair"
 export CARB_RECOVER_TO_DIR="$WORKDIR/restore_repair"
-bash "$RUN_META2/recover.sh"
+bash "$RUN_META2/recover.sh" --damaged
+
+info "Starting restore in 'damaged' mode..."
 
 RESTORE_REPAIR_ROOT="$CARB_RECOVER_TO_DIR/$CARB_START_BASENAME"
 info "After repair, restored tree under: ${RESTORE_REPAIR_ROOT}"
