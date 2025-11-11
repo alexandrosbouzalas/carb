@@ -13,6 +13,9 @@ REFRESH_DB="yes"
 SCOPE=""        # "", "system", or "user"
 PREFIX="${PREFIX:-}"
 
+# Remove data dirs by default
+REMOVE_DATA_DEFAULT="yes"
+
 # --- Parse args -------------------------------------------------------------
 while (($#)); do
   case "$1" in
@@ -23,15 +26,15 @@ while (($#)); do
     --no-refresh) REFRESH_DB="no" ;;
     -h|--help)
       cat <<EOF
-uninstall.sh — remove ${BIN_NAME} and its manpage.
+uninstall.sh — remove ${BIN_NAME}, its manpage, and its data dir(s).
 
 Usage:
   bash uninstall.sh [--system|--user] [--purge] [--dry-run] [--no-refresh]
 
 Options:
   --system       Uninstall from system prefix (uses sudo if required).
-  --user         Uninstall from per-user location (~/.local).
-  --purge        Also remove now-empty bin/man directories under the chosen scope.
+  --user         Uninstall from per-user location (~/.local or ~/Library on macOS).
+  --purge        Also remove now-empty bin/man/share parent directories under the chosen scope.
   --dry-run      Show what would be removed, but do nothing.
   --no-refresh   Skip refreshing man database after uninstall.
 
@@ -44,31 +47,26 @@ Notes:
 EOF
       exit 0
       ;;
-    *)
-      echo "Unknown option: $1" >&2; exit 2 ;;
+    *) echo "Unknown option: $1" >&2; exit 2 ;;
   esac
   shift
 done
 
 # --- Helpers ----------------------------------------------------------------
 have() { command -v "$1" >/dev/null 2>&1; }
-
-say() { printf '%s\n' "$*"; }
+say()  { printf '%s\n' "$*"; }
 do_run() {
   if [ "$DRY_RUN" = "yes" ]; then
-    say "[dry-run] $*"
+    printf '[dry-run]'
+    printf ' %q' "$@"
+    printf '\n'
   else
-    eval "$@"
+    "$@"
   fi
 }
-
-is_writable_dir() {
-  local d="$1"
-  [ -d "$d" ] && [ -w "$d" ]
-}
+is_writable_dir() { local d="$1"; [ -d "$d" ] && [ -w "$d" ]; }
 
 rm_file() {
-  # rm -f <path> (sudo if needed)
   local path="$1" use_sudo="$2"
   if [ -e "$path" ]; then
     if [ "$use_sudo" = "sudo" ]; then do_run sudo rm -f -- "$path"
@@ -77,11 +75,30 @@ rm_file() {
   fi
 }
 
+# Safely remove data dirs we recognize for this tool only
+rm_tree_safe() {
+  local d="$1" use_sudo="$2"
+  [ -d "$d" ] || return 0
+  local ok="no"
+  # Common share locations
+  if [[ "$d" == */share/"$BIN_NAME" ]]; then ok="yes"; fi
+  # macOS Application Support (user + system)
+  if [[ "$OS" == "Darwin" ]]; then
+    if [[ "$d" == "$HOME"/Library/Application\ Support/"$BIN_NAME" ]]; then ok="yes"; fi
+    if [[ "$d" == /Library/Application\ Support/"$BIN_NAME" ]]; then ok="yes"; fi
+  fi
+  if [ "$ok" = "yes" ]; then
+    if [ "$use_sudo" = "sudo" ]; then do_run sudo rm -rf -- "$d"
+    else do_run rm -rf -- "$d"
+    fi
+  else
+    say "WARN: refusing to remove non-matching dir: $d"
+  fi
+}
+
 maybe_rmdir() {
-  # remove dir if empty (sudo if needed)
   local d="$1" use_sudo="$2"
   if [ "$PURGE_EMPTY_DIRS" = "yes" ] && [ -d "$d" ]; then
-    # Only remove if empty
     if [ -z "$(ls -A "$d" 2>/dev/null || true)" ]; then
       if [ "$use_sudo" = "sudo" ]; then do_run sudo rmdir -- "$d"
       else do_run rmdir -- "$d"
@@ -98,7 +115,6 @@ refresh_man_db() {
     else do_run "mandb || true"
     fi
   elif [ "$OS" = "Darwin" ] && [ -x /usr/libexec/makewhatis ]; then
-    # Limit to the relevant man root to keep it fast
     if [ -n "$man_root" ] && [ -d "$man_root" ]; then
       if [ "$use_sudo" = "sudo" ]; then do_run "sudo /usr/libexec/makewhatis \"$man_root\" || true"
       else do_run "/usr/libexec/makewhatis \"$man_root\" || true"
@@ -111,10 +127,8 @@ refresh_man_db() {
 if [ -z "$PREFIX" ]; then
   case "$OS" in
     Darwin)
-      if have brew; then
-        PREFIX="$(brew --prefix 2>/dev/null || echo /usr/local)"
-      else
-        if [ -d /opt/homebrew ]; then PREFIX="/opt/homebrew"; else PREFIX="/usr/local"; fi
+      if have brew; then PREFIX="$(brew --prefix 2>/dev/null || echo /usr/local)"
+      else if [ -d /opt/homebrew ]; then PREFIX="/opt/homebrew"; else PREFIX="/usr/local"; fi
       fi
       ;;
     Linux|*BSD*) PREFIX="/usr/local" ;;
@@ -127,19 +141,22 @@ DEST_BIN_DIR="${PREFIX}/bin"
 DEST_MAN_DIR="${PREFIX}/share/man/man1"
 DEST_BIN="${DEST_BIN_DIR}/${BIN_NAME}"
 DEST_MAN="${DEST_MAN_DIR}/${BIN_NAME}.1"
+CARB_HOME_SYSTEM_SHARE="${PREFIX}/share/${BIN_NAME}"              # e.g. /usr/local/share/carb
+CARB_HOME_SYSTEM_MAC="/Library/Application Support/${BIN_NAME}"   # macOS system data
 
 # --- Paths (user) ------------------------------------------------------------
 USER_BIN_DIR="${HOME}/.local/bin"
 USER_MAN_DIR="${HOME}/.local/share/man/man1"
 USER_BIN="${USER_BIN_DIR}/${BIN_NAME}"
 USER_MAN="${USER_MAN_DIR}/${BIN_NAME}.1"
+CARB_HOME_USER_SHARE="${HOME}/.local/share/${BIN_NAME}"                 # e.g. ~/.local/share/carb
+CARB_HOME_USER_MAC="${HOME}/Library/Application Support/${BIN_NAME}"    # macOS user data
 
 # --- Decide sudo for system scope -------------------------------------------
 USE_SUDO=""
 BIN_DIR_WRITABLE="no"; is_writable_dir "$DEST_BIN_DIR" && BIN_DIR_WRITABLE="yes"
 MAN_DIR_WRITABLE="no"; is_writable_dir "$DEST_MAN_DIR" && MAN_DIR_WRITABLE="yes"
 PREFIX_WRITABLE="no"; [ -w "$PREFIX" ] 2>/dev/null && PREFIX_WRITABLE="yes"
-
 if [ "$BIN_DIR_WRITABLE" = "yes" ] && [ "$MAN_DIR_WRITABLE" = "yes" ] && [ "$PREFIX_WRITABLE" = "yes" ]; then
   USE_SUDO=""
 elif have sudo; then
@@ -149,42 +166,48 @@ fi
 # --- Uninstall routines ------------------------------------------------------
 uninstall_system() {
   say "==> Uninstalling (system prefix): $PREFIX"
-  say "    removing: $DEST_BIN"
-  rm_file "$DEST_BIN" "$USE_SUDO"
+  say "    removing: $DEST_BIN"; rm_file "$DEST_BIN" "$USE_SUDO"
+  say "    removing: $DEST_MAN"; rm_file "$DEST_MAN" "$USE_SUDO"
 
-  say "    removing: $DEST_MAN"
-  rm_file "$DEST_MAN" "$USE_SUDO"
-
-  # Optionally clean empty man/bin leaf dirs
-  if [ "$PURGE_EMPTY_DIRS" = "yes" ]; then
-    maybe_rmdir "$DEST_MAN_DIR" "$USE_SUDO"
-    maybe_rmdir "$(dirname "$DEST_MAN_DIR")" "$USE_SUDO"      # .../share/man
-    maybe_rmdir "$(dirname "$(dirname "$DEST_MAN_DIR")")" "$USE_SUDO"  # .../share
-    maybe_rmdir "$DEST_BIN_DIR" "$USE_SUDO"
+  if [ "$REMOVE_DATA_DEFAULT" = "yes" ]; then
+    say "    removing data dir: $CARB_HOME_SYSTEM_SHARE"; rm_tree_safe "$CARB_HOME_SYSTEM_SHARE" "$USE_SUDO"
+    if [ "$OS" = "Darwin" ]; then
+      say "    removing data dir: $CARB_HOME_SYSTEM_MAC"; rm_tree_safe "$CARB_HOME_SYSTEM_MAC" "$USE_SUDO"
+    fi
   fi
 
-  # Refresh man database, limiting to this prefix's man root if available
-  local man_root
-  man_root="$(dirname "$(dirname "$DEST_MAN_DIR")")"  # .../share/man
+  if [ "$PURGE_EMPTY_DIRS" = "yes" ]; then
+    maybe_rmdir "$DEST_MAN_DIR" "$USE_SUDO"
+    maybe_rmdir "$(dirname "$DEST_MAN_DIR")" "$USE_SUDO"               # .../share/man
+    maybe_rmdir "$(dirname "$(dirname "$DEST_MAN_DIR")")" "$USE_SUDO"  # .../share
+    maybe_rmdir "$DEST_BIN_DIR" "$USE_SUDO"
+    # do NOT attempt to purge /Library or "Application Support" parents
+  fi
+
+  local man_root; man_root="$(dirname "$(dirname "$DEST_MAN_DIR")")"
   refresh_man_db "$USE_SUDO" "$man_root"
 }
 
 uninstall_user() {
-  say "==> Uninstalling (per-user): $HOME/.local"
-  say "    removing: $USER_BIN"
-  rm_file "$USER_BIN" ""
+  say "==> Uninstalling (per-user): $HOME/.local and ~/Library"
+  say "    removing: $USER_BIN"; rm_file "$USER_BIN" ""
+  say "    removing: $USER_MAN"; rm_file "$USER_MAN" ""
 
-  say "    removing: $USER_MAN"
-  rm_file "$USER_MAN" ""
+  if [ "$REMOVE_DATA_DEFAULT" = "yes" ]; then
+    say "    removing data dir: $CARB_HOME_USER_SHARE"; rm_tree_safe "$CARB_HOME_USER_SHARE" ""
+    if [ "$OS" = "Darwin" ]; then
+      say "    removing data dir: $CARB_HOME_USER_MAC"; rm_tree_safe "$CARB_HOME_USER_MAC" ""
+    fi
+  fi
 
   if [ "$PURGE_EMPTY_DIRS" = "yes" ]; then
     maybe_rmdir "$USER_MAN_DIR" ""
-    maybe_rmdir "$(dirname "$USER_MAN_DIR")" ""       # ~/.local/share/man
-    maybe_rmdir "$(dirname "$(dirname "$USER_MAN_DIR")")" "" # ~/.local/share
+    maybe_rmdir "$(dirname "$USER_MAN_DIR")" ""                        # ~/.local/share/man
+    maybe_rmdir "$(dirname "$(dirname "$USER_MAN_DIR")")" ""           # ~/.local/share
     maybe_rmdir "$USER_BIN_DIR" ""
+    # do NOT purge ~/Library or "Application Support" parents
   fi
 
-  # Try to refresh man db for user space (may be a no-op)
   local man_root="$HOME/.local/share/man"
   refresh_man_db "" "$man_root"
 }
@@ -193,14 +216,13 @@ uninstall_user() {
 ANY_REMOVED="no"
 
 run_system() {
-  # Only try if paths exist or explicit scope
-  if [ -e "$DEST_BIN" ] || [ -e "$DEST_MAN" ] || [ "$SCOPE" = "system" ]; then
+  if [ -e "$DEST_BIN" ] || [ -e "$DEST_MAN" ] || [ -d "$CARB_HOME_SYSTEM_SHARE" ] || { [ "$OS" = "Darwin" ] && [ -d "$CARB_HOME_SYSTEM_MAC" ]; } || [ "$SCOPE" = "system" ]; then
     uninstall_system; ANY_REMOVED="yes"
   fi
 }
 
 run_user() {
-  if [ -e "$USER_BIN" ] || [ -e "$USER_MAN" ] || [ "$SCOPE" = "user" ]; then
+  if [ -e "$USER_BIN" ] || [ -e "$USER_MAN" ] || [ -d "$CARB_HOME_USER_SHARE" ] || { [ "$OS" = "Darwin" ] && [ -d "$CARB_HOME_USER_MAC" ]; } || [ "$SCOPE" = "user" ]; then
     uninstall_user; ANY_REMOVED="yes"
   fi
 }
@@ -208,16 +230,12 @@ run_user() {
 case "$SCOPE" in
   system) run_system ;;
   user)   run_user ;;
-  "")
-    # Try system first, then user
-    run_system
-    run_user
-    ;;
+  "")     run_system; run_user ;;
 esac
 
 say
-if [ "$ANY_REMOVED" = "yes" ]; then
-  say "✅ Uninstall finished${DRY_RUN:+ (dry-run)}."
+if [ "$DRY_RUN" = "yes" ]; then
+  say "✅ Uninstall finished (dry-run)."
 else
-  say "Nothing to remove. (${BIN_NAME} not found in system prefix '$PREFIX' or user paths.)"
+  say "✅ Uninstall finished."
 fi
