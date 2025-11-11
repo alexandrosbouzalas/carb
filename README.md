@@ -11,7 +11,6 @@ Each run creates a **self-contained metadata bundle** and a **recovery script** 
 > - **Portable** — POSIX shell, works on Linux and macOS  
 > - **Self-documenting** — Generates logs and recovery scripts
 
----
 
 ## 🧩 Why carb?
 
@@ -23,7 +22,23 @@ Backups often fail quietly: corruption, silent bitrot, or missing files.
 - Keeps **append-only** logs so every run is auditable.
 - Avoids complex backup formats — data remains as plain files.
 
----
+## ⚠️ Important Disclaimer
+
+`carb` is **not** a full system/OS backup or disk imaging tool. It is designed for **user data** (documents, photos, projects, archives, exported configs).
+
+It does **not**:
+- handle device nodes, sockets, FIFOs, special files, or symlinks faithfully for system restore,
+- preserve ownership (UID/GID), ACLs, xattrs/SELinux labels, or all timestamps on restore,
+- quiesce live application data (e.g., databases in `/var/lib/*`),
+- recreate a bootable OS, partitions, or bootloader.
+
+If you need a **whole-system** backup or a **bootable image**, use tools like:
+- **Imaging**: `dd`, `rpi-clone`, balenaEtcher/Win32DiskImager
+- **Repository backups with metadata**: `restic`, `borg`, `kopia`
+- **Filesystem snapshots**: btrfs/LVM + `rsync -aAXH --numeric-ids`
+
+Use `carb` for data; use imaging/snapshot tools for systems.
+
 
 ## ⚙️ How it works
 
@@ -37,8 +52,6 @@ Backups often fail quietly: corruption, silent bitrot, or missing files.
 3. **Record**: Logs per-run metadata under `blobs_meta/v05_<timestamp>/`.
 4. **Recover**: Generates a `recover.sh` script capable of restoring all files and verifying with PAR2.
 
----
-
 ## 📦 Installation
 
 ### Requirements
@@ -51,7 +64,7 @@ Backups often fail quietly: corruption, silent bitrot, or missing files.
 - `par2cmdline` (`par2create` or `par2`) for parity verification and repair
 
 
-> **INFO** : If the demo script complains that par2 is missing and automatic installation fails, try to manually install it.
+> **INFO** : If all fails and par2 cannot be automatically installed, try to manually install it.
 
 Example:
 
