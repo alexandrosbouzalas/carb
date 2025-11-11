@@ -33,8 +33,8 @@ Usage:
 
 Options:
   --system       Uninstall from system prefix (uses sudo if required).
-  --user         Uninstall from per-user location (~/.local or ~/Library on macOS).
-  --purge        Also remove now-empty bin/man/share parent directories under the chosen scope.
+  --user         Uninstall from per-user location (~/.local and ~/Library on macOS).
+  --purge        Also remove now-empty bin/man/share parent directories (safe; never purges Library).
   --dry-run      Show what would be removed, but do nothing.
   --no-refresh   Skip refreshing man database after uninstall.
 
@@ -55,6 +55,8 @@ done
 # --- Helpers ----------------------------------------------------------------
 have() { command -v "$1" >/dev/null 2>&1; }
 say()  { printf '%s\n' "$*"; }
+
+# run a command preserving argument boundaries (no eval)
 do_run() {
   if [ "$DRY_RUN" = "yes" ]; then
     printf '[dry-run]'
@@ -64,6 +66,7 @@ do_run() {
     "$@"
   fi
 }
+
 is_writable_dir() { local d="$1"; [ -d "$d" ] && [ -w "$d" ]; }
 
 rm_file() {
@@ -97,6 +100,7 @@ rm_tree_safe() {
 }
 
 maybe_rmdir() {
+  # remove dir if empty (sudo if needed)
   local d="$1" use_sudo="$2"
   if [ "$PURGE_EMPTY_DIRS" = "yes" ] && [ -d "$d" ]; then
     if [ -z "$(ls -A "$d" 2>/dev/null || true)" ]; then
@@ -110,14 +114,28 @@ maybe_rmdir() {
 refresh_man_db() {
   local use_sudo="$1" man_root="$2"
   [ "$REFRESH_DB" = "yes" ] || return 0
+
   if have mandb; then
-    if [ "$use_sudo" = "sudo" ]; then do_run "sudo mandb || true"
-    else do_run "mandb || true"
+    if [ "$DRY_RUN" = "yes" ]; then
+      if [ "$use_sudo" = "sudo" ]; then printf '[dry-run] %q\n' sudo mandb
+      else printf '[dry-run] %q\n' mandb
+      fi
+    else
+      if [ "$use_sudo" = "sudo" ]; then sudo mandb || true
+      else mandb || true
+      fi
     fi
   elif [ "$OS" = "Darwin" ] && [ -x /usr/libexec/makewhatis ]; then
+    # Limit to the relevant man root to keep it fast
     if [ -n "$man_root" ] && [ -d "$man_root" ]; then
-      if [ "$use_sudo" = "sudo" ]; then do_run "sudo /usr/libexec/makewhatis \"$man_root\" || true"
-      else do_run "/usr/libexec/makewhatis \"$man_root\" || true"
+      if [ "$DRY_RUN" = "yes" ]; then
+        if [ "$use_sudo" = "sudo" ]; then printf '[dry-run] %q %q\n' sudo /usr/libexec/makewhatis "$man_root"
+        else printf '[dry-run] %q %q\n' /usr/libexec/makewhatis "$man_root"
+        fi
+      else
+        if [ "$use_sudo" = "sudo" ]; then sudo /usr/libexec/makewhatis "$man_root" || true
+        else /usr/libexec/makewhatis "$man_root" || true
+        fi
       fi
     fi
   fi
@@ -177,14 +195,15 @@ uninstall_system() {
   fi
 
   if [ "$PURGE_EMPTY_DIRS" = "yes" ]; then
+    # Purge share/man/bin leaves under PREFIX (safe)
     maybe_rmdir "$DEST_MAN_DIR" "$USE_SUDO"
     maybe_rmdir "$(dirname "$DEST_MAN_DIR")" "$USE_SUDO"               # .../share/man
     maybe_rmdir "$(dirname "$(dirname "$DEST_MAN_DIR")")" "$USE_SUDO"  # .../share
     maybe_rmdir "$DEST_BIN_DIR" "$USE_SUDO"
-    # do NOT attempt to purge /Library or "Application Support" parents
+    # Intentionally do NOT purge /Library or "Application Support" parents.
   fi
 
-  local man_root; man_root="$(dirname "$(dirname "$DEST_MAN_DIR")")"
+  local man_root; man_root="$(dirname "$(dirname "$DEST_MAN_DIR")")"   # .../share/man
   refresh_man_db "$USE_SUDO" "$man_root"
 }
 
@@ -201,11 +220,12 @@ uninstall_user() {
   fi
 
   if [ "$PURGE_EMPTY_DIRS" = "yes" ]; then
+    # Purge leaves in ~/.local (safe)
     maybe_rmdir "$USER_MAN_DIR" ""
     maybe_rmdir "$(dirname "$USER_MAN_DIR")" ""                        # ~/.local/share/man
     maybe_rmdir "$(dirname "$(dirname "$USER_MAN_DIR")")" ""           # ~/.local/share
     maybe_rmdir "$USER_BIN_DIR" ""
-    # do NOT purge ~/Library or "Application Support" parents
+    # Intentionally do NOT purge ~/Library or "Application Support" parents.
   fi
 
   local man_root="$HOME/.local/share/man"
