@@ -50,6 +50,15 @@ Backups often fail quietly: corruption, silent bitrot, or missing files.
 - `file` (for MIME detection)
 - `par2cmdline` (`par2create` or `par2`) for parity verification and repair
 
+
+> **INFO** : If the demo script complains that par2 is missing and automatic installation fails, try to manually install it.
+
+Example:
+
+```bash
+sudo apt install par2
+```
+
 ### Auto-install
 If missing dependencies are detected, `carb` can attempt installation via:
 `apt`, `dnf`, `yum`, `pacman`, `zypper`, `apk`, `brew`, or `port`.

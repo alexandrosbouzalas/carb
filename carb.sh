@@ -208,7 +208,9 @@ dep_check_and_maybe_install() {
   if ! have openssl && ! have shasum; then missing_req+=("openssl (or shasum)"); fi
   if [[ "$CARB_ENABLE_MIME" == "1" ]] && ! have file; then missing_opt+=("file"); fi
   if [[ "$CARB_PAR2" == "1" ]] && ! have "$CARB_PAR2_CMD" && ! have par2create && ! have par2; then missing_req+=("par2cmdline"); fi
+
   if (( ${#missing_req[@]} == 0 && ${#missing_opt[@]} == 0 )); then return 0; fi
+
   echo "==> Pre-flight dependency check" >&2
   (( ${#missing_req[@]} )) && { echo "Missing REQUIRED tools:" >&2; printf '  - %s\n' "${missing_req[@]}" >&2; }
   (( ${#missing_opt[@]} )) && { echo "Missing OPTIONAL tools:" >&2; printf '  - %s\n' "${missing_opt[@]}" >&2; }
@@ -228,9 +230,27 @@ dep_check_and_maybe_install() {
   fi
 
   local -a install_pkgs=()
-  if ! have openssl && ! have shasum; then case "$mgr" in apt|dnf|yum|zypper|apk|pacman|brew|port) install_pkgs+=("openssl");; esac; fi
-  if [[ "$CARB_ENABLE_MIME" == "1" ]] && ! have file; then case "$mgr" in apt|dnf|yum|zypper|apk|pacman|port) install_pkgs+=("file");; brew) install_pkgs+=("file-formula");; esac; fi
-  if [[ "$CARB_PAR2" == "1" ]] && ! have "$CARB_PAR2_CMD" && ! have par2create && ! have par2; then case "$mgr" in apt|zypper|apk|brew|port) install_pkgs+=("par2");; dnf|yum|pacman) install_pkgs+=("par2cmdline");; esac; fi
+  # openssl or shasum
+  if ! have openssl && ! have shasum; then
+    case "$mgr" in
+      apt|dnf|yum|zypper|apk|pacman|brew|port) install_pkgs+=("openssl");;
+    esac
+  fi
+  # file(1)
+  if [[ "$CARB_ENABLE_MIME" == "1" ]] && ! have file; then
+    case "$mgr" in
+      apt|dnf|yum|zypper|apk|pacman|port) install_pkgs+=("file");;
+      brew) install_pkgs+=("file");; # was 'file-formula', now just 'file'
+    esac
+  fi
+  # par2 package names per manager
+  if [[ "$CARB_PAR2" == "1" ]] && ! have "$CARB_PAR2_CMD" && ! have par2create && ! have par2; then
+    case "$mgr" in
+      apt|brew|port)   install_pkgs+=("par2");;          # Debian/Ubuntu, Homebrew, MacPorts
+      dnf|yum|pacman)  install_pkgs+=("par2cmdline");;   # Fedora/RHEL/CentOS, Arch
+      zypper|apk)      install_pkgs+=("par2cmdline");;   # openSUSE, Alpine
+    esac
+  fi
 
   if (( ${#install_pkgs[@]} )); then
     local do_install=""
@@ -238,13 +258,20 @@ dep_check_and_maybe_install() {
       do_install="no"
     else
       do_install="${CARB_AUTOINSTALL_YES:-}"
+      # default to yes in non-interactive environments
+      if [[ -z "$do_install" ]] && ! is_tty; then
+        do_install="y"
+      fi
       if [[ -z "$do_install" ]] && is_tty; then
         echo -n "Attempt to install missing packages (${install_pkgs[*]}) via ${mgr:-<unknown>}? [y/N] " >&2
         read -r do_install || true
       fi
     fi
     if [[ "$do_install" == "1" || "$do_install" =~ ^[Yy]$ ]]; then
-      local sudo=""; [[ "${EUID:-$(id -u)}" -ne 0 && "$(command -v sudo || true)" ]] && sudo="sudo "
+      local sudo=""
+      if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+        if command -v sudo >/dev/null 2>&1; then sudo="sudo "; fi
+      fi
       local cmd=""
       case "$mgr" in
         apt)    cmd="${sudo}apt-get update && ${sudo}apt-get install -y ${install_pkgs[*]}";;
@@ -256,7 +283,11 @@ dep_check_and_maybe_install() {
         brew)   cmd="brew install ${install_pkgs[*]}";;
         port)   cmd="${sudo}port install ${install_pkgs[*]}";;
       esac
-      if [[ -n "$cmd" ]]; then bash -c "$cmd" || abort "Automatic installation failed. Please install packages manually: ${install_pkgs[*]}"; else echo "No supported package manager detected for auto-install." >&2; fi
+      if [[ -n "$cmd" ]]; then
+        bash -c "$cmd" || abort "Automatic installation failed. Please install packages manually: ${install_pkgs[*]}"
+      else
+        echo "No supported package manager detected for auto-install." >&2
+      fi
     fi
   fi
 
@@ -270,7 +301,9 @@ dep_check_and_maybe_install() {
     echo "Please install the above and re-run. Aborting." >&2
     exit 69
   fi
-  if [[ "$CARB_ENABLE_MIME" == "1" ]] && ! have file; then echo "WARN: 'file' not found; MIME detection will be skipped." >&2; fi
+  if [[ "$CARB_ENABLE_MIME" == "1" ]] && ! have file; then
+    echo "WARN: 'file' not found; MIME detection will be skipped." >&2
+  fi
 }
 dep_check_and_maybe_install
 
@@ -488,7 +521,7 @@ _par2_plan_for_size() {
   fi
   if [[ -n "${CARB_PAR2_BLOCKSIZE:-}" && "${CARB_PAR2_BLOCKSIZE}" != "auto" ]]; then
     local bs="${CARB_PAR2_BLOCKSIZE}"
-    local ds=$(( (sz_dec + bs - 1) / bs )); (( ds < 1 )) && ds=1
+    local ds=$(( (sz_dec + bs - 1) / bs  )); (( ds < 1 )) && ds=1
     local r="${DEFAULT_R}"
     local ps=$(( (ds * r + 99) / 100 ))
     if (( ps < MIN_PARITY_SLICES )); then r=$(( (MIN_PARITY_SLICES * 100 + ds - 1) / ds )); (( r > 80 )) && r=80; fi
