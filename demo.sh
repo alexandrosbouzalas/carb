@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# Demo for carb: full + incremental backup and PAR2 repair.
+# This version asks *the demo's own* "Install PAR2?" question first.
+# If you answer N, it exits immediately. If Y, it auto-installs via carb.
+
 set -Eeuo pipefail
 
 # ---------- styling ----------
@@ -19,6 +23,35 @@ warn() { printf "%s %s\n" "${WARN}" "$*"; }
 fail() { printf "%s %s\n" "${ERR}" "$*"; }
 trap 'printf "\n"' EXIT
 
+# Show prompts on terminal and also capture stderr
+run_with_visible_prompt_stderr() {
+  local logfile="$1"; shift
+  exec 3>&2
+  # shellcheck disable=SC2068
+  "$@" 2> >(tee -a "$logfile" >&3)
+  local rc=$?
+  exec 3>&-
+  return $rc
+}
+
+# Read a Y/N answer from the *controlling TTY* even if stdin is redirected.
+ask_yes_no() {
+  local prompt="${1:-Proceed? [y/N] }"
+  local ans=""
+  if [[ -t 0 ]]; then
+    read -r -p "$prompt" ans
+  else
+    if [[ -r /dev/tty ]]; then
+      # shellcheck disable=SC2162
+      read -r -p "$prompt" ans < /dev/tty
+    else
+      echo "Non-interactive session; defaulting to NO." >&2
+      ans="n"
+    fi
+  fi
+  [[ "$ans" =~ ^[Yy]$ ]]
+}
+
 # ---------- 0) Clean playground ----------
 WORKDIR="$(mktemp -d)"; cd "$WORKDIR"
 section "DEMO WORKSPACE" "${WORKDIR}"
@@ -34,11 +67,6 @@ cp "$CARB_BIN" ./carb.sh
 chmod +x ./carb.sh
 good "carb staged locally: ./carb.sh"
 
-# PAR2 availability (informational)
-PAR2_BIN="$(command -v par2 || true)"
-PAR2_CREATE_BIN="$(command -v par2create || true)"
-info "PAR2: par2=${PAR2_BIN:-<missing>}  par2create=${PAR2_CREATE_BIN:-<missing>}"
-
 # ---------- 1) Generate sample tree ----------
 section "GENERATE SAMPLE TREE"
 mkdir -p data/docs data/media data/tmp
@@ -48,27 +76,52 @@ dd if=/dev/urandom of=data/media/pic.bin bs=1K count=64 status=none 2>/dev/null
 printf "ignore me\n" > data/tmp/scratch.swp
 good "Sample data created: data/{docs,media,tmp}"
 
+# ---------- 1a) PAR2 preflight (our prompt; immediate abort on 'N') ----------
+section "PAR2 PREFLIGHT"
+PAR2_BIN="$(command -v par2 || true)"
+PAR2_CREATE_BIN="$(command -v par2create || true)"
+if [[ -z "$PAR2_BIN" && -z "$PAR2_CREATE_BIN" ]]; then
+  warn "PAR2 is not installed. This demo relies on PAR2 to show repair."
+  if ask_yes_no "Install PAR2 automatically when carb runs? [y/N] "; then
+    DEMO_WANTS_PAR2="yes"
+  else
+    fail "You chose not to install PAR2. Aborting now to avoid a degraded demo."
+    echo "Tip: re-run and answer 'y', or install 'par2'/'par2cmdline' manually first."
+    exit 1
+  fi
+else
+  DEMO_WANTS_PAR2="already"
+  good "PAR2 detected."
+fi
+
 # ---------- 2) FULL run ----------
-section "FULL RUN" "(exclude tmp-like files; capture stderr)"
-CARB_EXCLUDE_GLOBS="*.swp,.DS_Store" \
-CARB_COMMENT="initial demo run" \
-CARB_PAR2=1 \
-./carb.sh data --full 2> full_run.stderr || true
+section "FULL RUN" "(exclude tmp-like files; capture stderr; prompts visible)"
+if [[ "${DEMO_WANTS_PAR2:-}" == "yes" ]]; then
+  # Pass env to *carb* by making them part of the command (via `env`)
+  run_with_visible_prompt_stderr full_run.stderr \
+    env CARB_EXCLUDE_GLOBS="*.swp,.DS_Store" \
+        CARB_COMMENT="initial demo run" \
+        CARB_PAR2=1 \
+        CARB_AUTOINSTALL_ASK=1 \
+        CARB_AUTOINSTALL_YES=y \
+        ./carb.sh data --full || true
+else
+  run_with_visible_prompt_stderr full_run.stderr \
+    env CARB_EXCLUDE_GLOBS="*.swp,.DS_Store" \
+        CARB_COMMENT="initial demo run" \
+        CARB_PAR2=1 \
+        CARB_AUTOINSTALL_ASK=1 \
+        CARB_AUTOINSTALL_YES= \
+        ./carb.sh data --full || true
+fi
 
-note "Artifacts:"
-echo "== blobs:"; ls -1 "blobs_sha256" 2>/dev/null | head || echo "(stored under CARB_HOME)"
-echo
-
-echo "== meta (latest):"
-# Find latest run meta under effective CARB_HOME
+# ---------- Find run metadata & effective CARB_HOME ----------
 default_home_mac="${HOME}/Library/Application Support/carb"
 default_home_linux="${XDG_DATA_HOME:-$HOME/.local/share}/carb"
-# Prefer env CARB_HOME if user set it, else mac default (we're on macOS in your logs), else linux default
 CARB_HOME_GUESS="${CARB_HOME:-$default_home_mac}"
 META_ROOT="${CARB_HOME_GUESS}/blobs_meta"
 RUN_META="$(ls -1d "${META_ROOT}/v05_"* 2>/dev/null | tail -n1 || true)"
 if [[ -z "${RUN_META}" ]]; then
-  # fall back to linux default if mac path was wrong
   META_ROOT="${default_home_linux}/blobs_meta"
   RUN_META="$(ls -1d "${META_ROOT}/v05_"* 2>/dev/null | tail -n1 || true)"
 fi
@@ -78,22 +131,24 @@ if [[ -z "${RUN_META}" ]]; then
   tail -n 200 full_run.stderr || true
   exit 1
 fi
-printf "  %s\n" "$RUN_META"
-printf "  carb_settings:\n"
-sed -n '1p' "$RUN_META/carb_settings" || true
-echo
+printf "  Latest meta: %s\n" "$RUN_META"
+printf "  carb_settings:\n"; sed -n '1p' "$RUN_META/carb_settings" || true; echo
 
-# Extract effective CARB_HOME actually used by the run
 CARB_HOME_USED="$(sed -n 's/.*home=\(.*\)$/\1/p' "$RUN_META/carb_settings" | head -n1)"
-if [[ -z "$CARB_HOME_USED" ]]; then CARB_HOME_USED="$CARB_HOME_GUESS"; fi
+[[ -z "$CARB_HOME_USED" ]] && CARB_HOME_USED="${CARB_HOME_GUESS}"
 BLOB_DIR="${CARB_HOME_USED}/blobs_sha256"
 PAR_DIR="${CARB_HOME_USED}/blobs_par2"
 
-echo "== parity files:"
-if compgen -G "${PAR_DIR}/*.par2" >/dev/null; then
-  (cd "$PAR_DIR" && ls -1 | head) || true
-else
-  warn "(none yet) — if par2/par2create is missing, install it and re-run; carb will backfill on later runs."
+# ---------- Require parity now (if we asked to install it) ----------
+section "PARITY CHECK"
+if [[ "${DEMO_WANTS_PAR2:-}" == "yes" || "${DEMO_WANTS_PAR2:-}" == "already" ]]; then
+  if ! compgen -G "${PAR_DIR}/*.par2" >/dev/null; then
+    fail "No PAR2 parity found after full run."
+    echo "If you just installed PAR2, run a full backup again to generate parity."
+    echo "Try: CARB_PAR2=1 ./carb.sh data --full"
+    exit 1
+  fi
+  good "Parity detected — continuing."
 fi
 
 # ---------- 3) Prepare INCREMENTAL change & ref cutoff ----------
@@ -113,8 +168,16 @@ REF_FILE="$RUN_META/carb_starttime"
 info "Reference cutoff set to: ${REF_FILE}"
 
 # ---------- 4) INCREMENTAL run ----------
-section "INCREMENTAL RUN" "(capture stderr)"
-CARB_PAR2=1 ./carb.sh data "$REF_FILE" 2> incr_run.stderr || true
+section "INCREMENTAL RUN" "(capture stderr; prompts visible)"
+if [[ "${DEMO_WANTS_PAR2:-}" == "yes" ]]; then
+  run_with_visible_prompt_stderr incr_run.stderr \
+    env CARB_PAR2=1 CARB_AUTOINSTALL_ASK=1 CARB_AUTOINSTALL_YES=y \
+        ./carb.sh data "$REF_FILE" || true
+else
+  run_with_visible_prompt_stderr incr_run.stderr \
+    env CARB_PAR2=1 CARB_AUTOINSTALL_ASK=1 CARB_AUTOINSTALL_YES= \
+        ./carb.sh data "$REF_FILE" || true
+fi
 
 # Refresh latest meta after incremental
 RUN_META2="$(ls -1d "${META_ROOT}/v05_"* 2>/dev/null | tail -n1 || true)"
@@ -129,13 +192,12 @@ echo "New blobs this run:"; cat "$RUN_META2/INDEX_NEW.txt" || true
 
 # Parse CARB_START_BASENAME from the run's recover.sh so we restore to the right place
 CARB_START_BASENAME="$(sed -n 's/^CARB_START_BASENAME="\([^"]*\)".*/\1/p' "$RUN_META2/recover.sh" | head -n1)"
-if [[ -z "$CARB_START_BASENAME" ]]; then CARB_START_BASENAME="data"; fi
+[[ -z "$CARB_START_BASENAME" ]] && CARB_START_BASENAME="data"
 
 # ---------- 5) Recovery demo ----------
 section "RECOVERY DEMO" "(verify restore structure)"
 export CARB_RECOVER_TO_DIR="$WORKDIR/restore"
 bash "$RUN_META2/recover.sh"
-
 RESTORE_ROOT="$CARB_RECOVER_TO_DIR/$CARB_START_BASENAME"
 info "Restored tree under: ${RESTORE_ROOT}"
 find "$RESTORE_ROOT" -maxdepth 3 -type f -print || true
@@ -154,7 +216,15 @@ info "Victim blob: ${VICTIM_BLOB}"
 # ensure parity exists/backfill
 if ! compgen -G "${PAR_DIR}/${VICTIM_BLOB}.par2" >/dev/null; then
   warn "Parity for readme.txt blob not found; re-running once to backfill..."
-  CARB_PAR2=1 ./carb.sh data --full >/dev/null 2>&1 || true
+  if [[ "${DEMO_WANTS_PAR2:-}" == "yes" ]]; then
+    run_with_visible_prompt_stderr backfill.stderr \
+      env CARB_PAR2=1 CARB_AUTOINSTALL_ASK=1 CARB_AUTOINSTALL_YES=y \
+          ./carb.sh data --full >/dev/null 2>&1 || true
+  else
+    run_with_visible_prompt_stderr backfill.stderr \
+      env CARB_PAR2=1 CARB_AUTOINSTALL_ASK=1 CARB_AUTOINSTALL_YES= \
+          ./carb.sh data --full >/dev/null 2>&1 || true
+  fi
 fi
 
 info "Corrupting blob (flip 1 byte @ offset 64)"
@@ -173,7 +243,7 @@ find "$RESTORE_REPAIR_ROOT" -maxdepth 3 -type f -print || true
 if diff -u "data/docs/readme.txt" "$RESTORE_REPAIR_ROOT/docs/readme.txt" >/dev/null; then
   good "readme.txt repaired (or verified clean) via PAR2."
 else
-  fail "readme.txt differs. If parity is missing, install par2/par2create and re-run."
+  fail "readme.txt differs. Inspect parity or rerun full backup to regenerate PAR2."
   echo "---- FULL run stderr (tail) ----"; tail -n 50 full_run.stderr || true
   echo "---- INCR run stderr (tail) ----"; tail -n 50 incr_run.stderr || true
   exit 2
